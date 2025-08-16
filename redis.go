@@ -11,27 +11,28 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type Marshaler interface {
+type Marshaller interface {
 	Marshal(v ServerInfo) ([]byte, error)
 	Unmarshal(data []byte) (v ServerInfo, err error)
 }
 
-func NewJSONMarshaler(infoMaker func() ServerInfo) Marshaler {
-	return &jsonMarshaler{
+func NewJSONMarshaller(infoMaker func() ServerInfo) Marshaller {
+	return &jsonMarshaller{
 		infoMaker: infoMaker,
 	}
 }
 
-type jsonMarshaler struct {
+type jsonMarshaller struct {
 	infoMaker func() ServerInfo
 }
 
-// 实现 Marshaler 接口
-func (j *jsonMarshaler) Marshal(v ServerInfo) ([]byte, error) {
+// 实现 Marshaller 接口
+
+func (j *jsonMarshaller) Marshal(v ServerInfo) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-func (j *jsonMarshaler) Unmarshal(data []byte) (v ServerInfo, err error) {
+func (j *jsonMarshaller) Unmarshal(data []byte) (v ServerInfo, err error) {
 	if j.infoMaker == nil {
 		return nil, fmt.Errorf("infoMaker is nil")
 	}
@@ -51,7 +52,7 @@ var _ Discovery = (*RedisDiscovery)(nil)
 
 type RedisDiscovery struct {
 	client    *redis.Client
-	marshaler Marshaler
+	marshaler Marshaller
 	lg        *logrus.Logger
 	closeOnce sync.Once
 
@@ -80,7 +81,7 @@ func (r *RedisDiscovery) SyncServers() {
 	r.scanServers()
 }
 
-func NewRedisDiscovery(client *redis.Client, marshaler Marshaler, lg *logrus.Logger) *RedisDiscovery {
+func NewRedisDiscovery(client *redis.Client, marshaler Marshaller, lg *logrus.Logger) *RedisDiscovery {
 
 	lg.Info("开始创建RedisDiscovery实例")
 
@@ -393,7 +394,7 @@ func (r *RedisDiscovery) scanServiceByName(name string, listeners []Listener) {
 			r.lg.WithFields(logrus.Fields{
 				"service_name": name,
 				"service_id":   id,
-				"version":      info.Version(),
+				"version":      info.GetVersion(),
 			}).Debug("检测到新增服务实例")
 			for _, listener := range listeners {
 				listener.OnAdd(info)
@@ -404,8 +405,8 @@ func (r *RedisDiscovery) scanServiceByName(name string, listeners []Listener) {
 			r.lg.WithFields(logrus.Fields{
 				"service_name": name,
 				"service_id":   id,
-				"old_version":  oldCache[id].Version(),
-				"new_version":  info.Version(),
+				"old_version":  oldCache[id].GetVersion(),
+				"new_version":  info.GetVersion(),
 			}).Debug("检测到服务实例更新")
 			for _, listener := range listeners {
 				listener.OnUpdate(info)
@@ -422,7 +423,7 @@ func (r *RedisDiscovery) scanServiceByName(name string, listeners []Listener) {
 			r.lg.WithFields(logrus.Fields{
 				"service_name": name,
 				"service_id":   id,
-				"version":      info.Version(),
+				"version":      info.GetVersion(),
 			}).Debug("检测到服务实例移除")
 			for _, listener := range listeners {
 				listener.OnRemove(info)
@@ -472,7 +473,7 @@ func (r *RedisDiscovery) GetServer(name string, id string) (info ServerInfo) {
 			r.lg.WithFields(logrus.Fields{
 				"service_name": name,
 				"service_id":   id,
-				"version":      service.Version(),
+				"version":      service.GetVersion(),
 			}).Debug("获取到服务实例")
 			return service
 		}
@@ -550,7 +551,7 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 	r.lg.WithFields(logrus.Fields{
 		"service_name": name,
 		"service_id":   id,
-		"version":      info.Version(),
+		"version":      info.GetVersion(),
 	}).Info("开始注册服务")
 
 	r.lock.Lock()
@@ -626,7 +627,7 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 	}
 	// 更新本地缓存
 	r.lock.Lock()
-	if r.localServices[name][id].Version() == info.Version() {
+	if r.localServices[name][id].GetVersion() == info.GetVersion() {
 		r.lock.Unlock()
 		return nil
 	}
@@ -635,7 +636,7 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 	r.lg.WithFields(logrus.Fields{
 		"service_name": name,
 		"service_id":   id,
-		"version":      info.Version(),
+		"version":      info.GetVersion(),
 	}).Debug("更新服务信息到Redis")
 	err := r.updateServiceToRedis(info)
 	if err != nil {
@@ -654,7 +655,7 @@ func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo) error {
 	r.lg.WithFields(logrus.Fields{
 		"service_name": info.GetName(),
 		"service_id":   info.GetID(),
-		"version":      info.Version(),
+		"version":      info.GetVersion(),
 		"redis_key":    key,
 	}).Debug("开始更新服务信息到Redis")
 

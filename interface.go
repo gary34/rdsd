@@ -6,10 +6,10 @@ type ServerInfo interface {
 	GetID() string
 	// GetName 获取服务名称
 	GetName() string
-	// LastUpdateTime 获取最后更新时间
-	LastUpdateTime() int64
-	// Version 版本号
-	Version() string
+	// GetUpdateTime 获取最后更新时间
+	GetUpdateTime() int64
+	// GetVersion 版本号
+	GetVersion() string
 	// Clone 复制服务信息，防止外部修改
 	Clone() ServerInfo
 }

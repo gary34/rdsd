@@ -29,11 +29,11 @@ func (t *testServerInfo) GetName() string {
 	return t.Name
 }
 
-func (t *testServerInfo) LastUpdateTime() int64 {
+func (t *testServerInfo) GetUpdateTime() int64 {
 	return t.LastUpdate
 }
 
-func (t *testServerInfo) Version() string {
+func (t *testServerInfo) GetVersion() string {
 	return t.VersionNum
 }
 
@@ -199,7 +199,7 @@ func setupTestRedis(t *testing.T) *redis.Client {
 // 创建测试用的RedisDiscovery
 func setupTestDiscovery(t *testing.T) (*RedisDiscovery, *redis.Client) {
 	client := setupTestRedis(t)
-	marshaler := NewJSONMarshaler(func() ServerInfo {
+	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
 	})
 	lg := logrus.New()
@@ -226,7 +226,7 @@ func TestRedisDiscovery_Register(t *testing.T) {
 	assert.Len(t, localServices, 1)
 	assert.Equal(t, "service1", localServices[0].GetID())
 	assert.Equal(t, "test-service", localServices[0].GetName())
-	assert.Equal(t, "v1.0.0", localServices[0].Version())
+	assert.Equal(t, "v1.0.0", localServices[0].GetVersion())
 
 	// 等待一段时间确保数据写入Redis
 	time.Sleep(100 * time.Millisecond)
@@ -256,7 +256,7 @@ func TestRedisDiscovery_GetServer(t *testing.T) {
 		VersionNum: "v1.0.0",
 	}
 
-	marshaler := NewJSONMarshaler(func() ServerInfo {
+	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
 	})
 	data, err := marshaler.Marshal(testInfo)
@@ -277,7 +277,7 @@ func TestRedisDiscovery_GetServer(t *testing.T) {
 	assert.NotNil(t, info)
 	assert.Equal(t, "service1", info.GetID())
 	assert.Equal(t, "test-service", info.GetName())
-	assert.Equal(t, "v1.0.0", info.Version())
+	assert.Equal(t, "v1.0.0", info.GetVersion())
 
 	// 测试不存在的服务
 	info = discovery.GetServer("test-service", "nonexistent")
@@ -299,7 +299,7 @@ func TestRedisDiscovery_GetServers(t *testing.T) {
 	ctx := context.Background()
 	key := "rdsd:service:test-service"
 
-	marshaler := NewJSONMarshaler(func() ServerInfo {
+	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
 	})
 
@@ -400,7 +400,7 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 		VersionNum: "v1.0.0",
 	}
 
-	marshaler := NewJSONMarshaler(func() ServerInfo {
+	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
 	})
 	data, err := marshaler.Marshal(testInfo)
@@ -433,7 +433,7 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 	// 验证更新事件
 	updateEvents := listener.GetUpdateEvents()
 	assert.Len(t, updateEvents, 1)
-	assert.Equal(t, "v1.0.1", updateEvents[0].Version())
+	assert.Equal(t, "v1.0.1", updateEvents[0].GetVersion())
 
 	// 删除服务
 	listener.ClearEvents()
@@ -469,7 +469,7 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	// 验证服务可以被获取
 	info := discovery.GetServer("test-service", "service1")
 	assert.NotNil(t, info)
-	assert.Equal(t, "v1.0.0", info.Version())
+	assert.Equal(t, "v1.0.0", info.GetVersion())
 
 	// 验证监听器收到添加事件
 	addEvents := listener.GetAddEvents()
@@ -488,7 +488,7 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	// 验证服务版本已更新
 	info = discovery.GetServer("test-service", "service1")
 	assert.NotNil(t, info)
-	assert.Equal(t, "v1.0.1", info.Version())
+	assert.Equal(t, "v1.0.1", info.GetVersion())
 
 	// 关闭服务
 	listener.ClearEvents()
@@ -519,7 +519,7 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	defer discovery1.Close()
 
 	// 创建第二个discovery实例来模拟分布式环境
-	marshaler := NewJSONMarshaler(func() ServerInfo {
+	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
 	})
 	lg := logrus.New()
@@ -546,7 +546,7 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	// 验证discovery2通过pub/sub通知感知到了服务变化
 	info := discovery2.GetServer("test-service", "service1")
 	assert.NotNil(t, info, "discovery2应该通过pub/sub通知感知到服务注册")
-	assert.Equal(t, "v1.0.0", info.Version())
+	assert.Equal(t, "v1.0.0", info.GetVersion())
 
 	// 验证监听器收到添加事件
 	addEvents := listener.GetAddEvents()
