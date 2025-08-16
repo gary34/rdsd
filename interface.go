@@ -10,6 +10,7 @@ type ServerInfo interface {
 	LastUpdateTime() int64
 	//版本号
 	Version() string
+	Clone() ServerInfo
 }
 
 type ServerInfoProvider interface {
@@ -34,6 +35,8 @@ type Discovery interface {
 	AddListener(l Listener)
 	// 手动触发服务同步
 	SyncServers()
+	// Close 关闭服务发现，清理资源
+	Close() error
 }
 
 // Listener 服务变化监听器接口，用于监听服务的添加和移除事件

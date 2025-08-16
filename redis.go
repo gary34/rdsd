@@ -53,6 +53,7 @@ type RedisDiscovery struct {
 	client    *redis.Client
 	marshaler Marshaler
 	lg        *logrus.Logger
+	closeOnce sync.Once
 
 	// 统一的读写锁
 	lock sync.RWMutex
@@ -66,6 +67,10 @@ type RedisDiscovery struct {
 	localServices map[string]map[string]ServerInfo
 	// 注册的服务提供者 map[serviceName]map[serviceID]ServerInfoProvider
 	providers map[string]map[string]ServerInfoProvider
+	// pub/sub相关
+	pubsub    *redis.PubSub
+	subCtx    context.Context
+	subCancel context.CancelFunc
 }
 
 // SyncServers implements Discovery.
@@ -79,6 +84,7 @@ func NewRedisDiscovery(client *redis.Client, marshaler Marshaler, lg *logrus.Log
 
 	lg.Info("开始创建RedisDiscovery实例")
 
+	subCtx, subCancel := context.WithCancel(context.Background())
 	r := &RedisDiscovery{
 		client:        client,
 		marshaler:     marshaler,
@@ -88,27 +94,37 @@ func NewRedisDiscovery(client *redis.Client, marshaler Marshaler, lg *logrus.Log
 		cache:         make(map[string]map[string]ServerInfo),
 		localServices: make(map[string]map[string]ServerInfo),
 		providers:     make(map[string]map[string]ServerInfoProvider),
+		subCtx:        subCtx,
+		subCancel:     subCancel,
 	}
 
 	r.lg.WithFields(logrus.Fields{
 		"expire_time":    r.expire,
 		"marshaler_type": fmt.Sprintf("%T", r.marshaler),
 	}).Info("RedisDiscovery配置完成")
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	// 启动pub/sub订阅器
+	r.lg.Info("启动pub/sub订阅器")
+	go r.startSubscriber(&wg)
 
 	// 启动定时扫描器
 	r.lg.Info("启动定时扫描器")
-	go r.startScanner()
-
+	go r.startScanner(&wg)
+	wg.Wait()
 	r.lg.Info("RedisDiscovery实例创建完成")
 	return r
 }
 
-func (r *RedisDiscovery) startScanner() {
+func (r *RedisDiscovery) startScanner(wg *sync.WaitGroup) {
+	// 由于有了pub/sub主动通知，降低定时扫描频率，作为兜底机制
+	scanInterval := r.expire * 3 // 扫描间隔为过期时间的3倍
 	r.lg.WithFields(logrus.Fields{
-		"scan_interval": r.expire,
-	}).Info("定时扫描器启动")
+		"scan_interval": scanInterval,
+		"expire_time":   r.expire,
+	}).Info("定时扫描器启动（作为pub/sub的兜底机制）")
 
-	ticker := time.NewTicker(r.expire)
+	ticker := time.NewTicker(scanInterval)
 	defer ticker.Stop()
 	doScan := func() {
 		r.lg.Debug("定时扫描器触发，开始扫描服务")
@@ -119,6 +135,7 @@ func (r *RedisDiscovery) startScanner() {
 			"scan_duration": duration,
 		}).Debug("定时扫描完成")
 	}
+	wg.Done()
 	for range ticker.C {
 		doScan()
 	}
@@ -169,6 +186,134 @@ func (r *RedisDiscovery) scanServers() {
 
 func (r *RedisDiscovery) key(name string) string {
 	return fmt.Sprintf("rdsd:service:%s", name)
+}
+
+func (r *RedisDiscovery) notifyChannel(name string) string {
+	return fmt.Sprintf("rdsd:notify:%s", name)
+}
+
+// startSubscriber 启动Redis pub/sub订阅器
+func (r *RedisDiscovery) startSubscriber(wg *sync.WaitGroup) {
+	r.lg.Info("pub/sub订阅器启动")
+
+	// 订阅所有服务变化通知
+	r.pubsub = r.client.PSubscribe(r.subCtx, "rdsd:notify:*")
+	defer func() {
+		if r.pubsub != nil {
+			r.pubsub.Close()
+		}
+	}()
+
+	r.lg.Info("开始监听Redis pub/sub消息")
+	ch := r.pubsub.Channel()
+	wg.Done()
+	for {
+		select {
+		case msg := <-ch:
+			if msg == nil {
+				continue
+			}
+			r.lg.WithFields(logrus.Fields{
+				"channel": msg.Channel,
+				"payload": msg.Payload,
+			}).Debug("收到pub/sub通知")
+			r.handlePubSubMessage(msg)
+		case <-r.subCtx.Done():
+			r.lg.Info("pub/sub订阅器停止")
+			return
+		}
+	}
+}
+
+// handlePubSubMessage 处理pub/sub消息
+func (r *RedisDiscovery) handlePubSubMessage(msg *redis.Message) {
+	// 从频道名称中提取服务名称
+	// 频道格式: rdsd:notify:serviceName
+	if len(msg.Channel) < 13 { // "rdsd:notify:".length = 12
+		return
+	}
+	serviceName := msg.Channel[12:] // 去掉"rdsd:notify:"前缀
+
+	r.lg.WithFields(logrus.Fields{
+		"service_name": serviceName,
+		"action":       msg.Payload,
+	}).Debug("处理服务变化通知")
+
+	// 获取该服务的监听器
+	r.lock.RLock()
+	var targetListeners []Listener
+	for _, listener := range r.listeners {
+		for _, watchName := range listener.WatchNames() {
+			if watchName == serviceName {
+				targetListeners = append(targetListeners, listener)
+				break
+			}
+		}
+	}
+	r.lock.RUnlock()
+
+	if len(targetListeners) > 0 {
+		r.lg.WithFields(logrus.Fields{
+			"service_name":   serviceName,
+			"listener_count": len(targetListeners),
+		}).Debug("触发服务扫描")
+		// 立即扫描该服务
+		r.scanServiceByName(serviceName, targetListeners)
+	}
+}
+
+// publishServiceChange 发布服务变化通知
+func (r *RedisDiscovery) publishServiceChange(serviceName, action string) {
+	channel := r.notifyChannel(serviceName)
+	ctx := context.Background()
+
+	r.lg.WithFields(logrus.Fields{
+		"service_name": serviceName,
+		"action":       action,
+		"channel":      channel,
+	}).Debug("发布服务变化通知")
+
+	err := r.client.Publish(ctx, channel, action).Err()
+	if err != nil {
+		r.lg.WithFields(logrus.Fields{
+			"service_name": serviceName,
+			"action":       action,
+			"channel":      channel,
+			"error":        err,
+		}).Error("发布服务变化通知失败")
+	} else {
+		r.lg.WithFields(logrus.Fields{
+			"service_name": serviceName,
+			"action":       action,
+			"channel":      channel,
+		}).Debug("服务变化通知发布成功")
+	}
+}
+
+// Close 关闭RedisDiscovery，清理资源
+func (r *RedisDiscovery) Close() error {
+	var err error
+	r.closeOnce.Do(func() {
+		r.lg.Info("开始关闭RedisDiscovery")
+		// 取消订阅上下文
+		if r.subCancel != nil {
+			r.subCancel()
+		}
+		// 关闭pub/sub连接
+		if r.pubsub != nil {
+			err = r.pubsub.Close()
+			if err != nil {
+				r.lg.WithFields(logrus.Fields{
+					"error": err,
+				}).Error("关闭pub/sub连接失败")
+				//return err
+				return
+			}
+		}
+		r.lg.Info("RedisDiscovery关闭完成")
+	})
+
+	return nil
 }
 
 func (r *RedisDiscovery) scanServiceByName(name string, listeners []Listener) {
@@ -418,7 +563,7 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 	}
 
 	// 保存本地服务信息和提供者
-	r.localServices[name][id] = info
+	r.localServices[name][id] = info.Clone()
 	r.providers[name][id] = provider
 	r.lock.Unlock()
 
@@ -427,14 +572,26 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 		"service_id":   id,
 	}).Debug("服务信息已保存到本地缓存")
 
+	// 立即注册一次
+	err = r.updateServiceToRedis(info)
+	if err != nil {
+		r.lg.WithFields(logrus.Fields{
+			"service_name": name,
+			"service_id":   id,
+			"error":        err,
+		}).Error("立即注册服务到Redis失败")
+		return err
+	}
 	// 启动goroutine定时更新服务信息到Redis
+	wg := sync.WaitGroup{}
+	wg.Add(1)
 	go func() {
 		r.lg.WithFields(logrus.Fields{
 			"service_name": name,
 			"service_id":   id,
 			"interval":     r.expire / 2,
 		}).Debug("启动服务定时更新协程")
-
+		wg.Done()
 		ticker := time.NewTicker(r.expire / 2) // 更新频率为过期时间的一半
 		defer ticker.Stop()
 		for {
@@ -455,18 +612,7 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 			}
 		}
 	}()
-
-	// 立即注册一次
-	err = r.updateServiceToRedis(info)
-	if err != nil {
-		r.lg.WithFields(logrus.Fields{
-			"service_name": name,
-			"service_id":   id,
-			"error":        err,
-		}).Error("立即注册服务到Redis失败")
-		return err
-	}
-
+	wg.Wait()
 	r.lg.WithFields(logrus.Fields{
 		"service_name": name,
 		"service_id":   id,
@@ -478,6 +624,14 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 	if info == nil {
 		return nil
 	}
+	// 更新本地缓存
+	r.lock.Lock()
+	if r.localServices[name][id].Version() == info.Version() {
+		r.lock.Unlock()
+		return nil
+	}
+	r.localServices[name][id] = info.Clone()
+	r.lock.Unlock()
 	r.lg.WithFields(logrus.Fields{
 		"service_name": name,
 		"service_id":   id,
@@ -490,11 +644,6 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 			"service_id":   id,
 			"error":        err,
 		}).Error("更新服务信息到Redis失败")
-	} else {
-		// 更新本地缓存
-		r.lock.Lock()
-		r.localServices[name][id] = info
-		r.lock.Unlock()
 	}
 	return nil
 }
@@ -558,6 +707,9 @@ func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo) error {
 		"expire_time":  r.expire,
 	}).Debug("Redis键过期时间设置成功")
 
+	// 发布服务变化通知
+	r.publishServiceChange(info.GetName(), "update")
+
 	return nil
 }
 
@@ -586,6 +738,8 @@ func (r *RedisDiscovery) unregisterService(name, id string) {
 			"service_id":   id,
 			"redis_key":    key,
 		}).Debug("服务信息已从Redis删除")
+		// 发布服务移除通知
+		r.publishServiceChange(name, "remove")
 	}
 
 	r.lock.Lock()

@@ -37,12 +37,22 @@ func (t *testServerInfo) Version() string {
 	return t.VersionNum
 }
 
+func (t *testServerInfo) Clone() ServerInfo {
+	return &testServerInfo{
+		ID:         t.ID,
+		Name:       t.Name,
+		LastUpdate: t.LastUpdate,
+		VersionNum: t.VersionNum,
+	}
+}
+
 // 测试用的ServerInfoProvider实现
 type testServerInfoProvider struct {
 	info       *testServerInfo
 	doneChan   chan struct{}
 	updateChan chan ServerInfo
 	mutex      sync.RWMutex
+	closed     bool
 }
 
 func newTestServerInfoProvider(id, name, version string) *testServerInfoProvider {
@@ -79,8 +89,12 @@ func (t *testServerInfoProvider) Done() <-chan struct{} {
 }
 
 func (t *testServerInfoProvider) Close() {
-	close(t.doneChan)
-	// close(t.updateChan)
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	if !t.closed {
+		close(t.doneChan)
+		t.closed = true
+	}
 }
 
 func (t *testServerInfoProvider) UpdateVersion(version string) {
@@ -369,6 +383,7 @@ func TestRedisDiscovery_LocalServers(t *testing.T) {
 func TestRedisDiscovery_AddListener(t *testing.T) {
 	discovery, client := setupTestDiscovery(t)
 	defer client.Close()
+	defer discovery.Close()
 
 	// 创建监听器
 	listener := newTestListener("test-service")
@@ -394,8 +409,7 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 	err = client.HSet(ctx, key, "service1", data).Err()
 	require.NoError(t, err)
 
-	// 等待扫描器发现并通知（扫描间隔为10秒）
-	// time.Sleep(11 * time.Second)
+	// 手动同步服务发现
 	discovery.SyncServers()
 	// 验证添加事件
 	addEvents := listener.GetAddEvents()
@@ -413,8 +427,8 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 	err = client.HSet(ctx, key, "service1", data).Err()
 	require.NoError(t, err)
 
-	// 等待扫描器发现更新（扫描间隔为10秒）
-	time.Sleep(11 * time.Second)
+	// 手动同步服务发现
+	discovery.SyncServers()
 
 	// 验证更新事件
 	updateEvents := listener.GetUpdateEvents()
@@ -426,8 +440,8 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 	err = client.HDel(ctx, key, "service1").Err()
 	require.NoError(t, err)
 
-	// 等待扫描器发现删除（扫描间隔为10秒）
-	time.Sleep(11 * time.Second)
+	// 手动同步服务发现
+	discovery.SyncServers()
 
 	// 验证删除事件
 	removeEvents := listener.GetRemoveEvents()
@@ -438,6 +452,7 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	discovery, client := setupTestDiscovery(t)
 	defer client.Close()
+	defer discovery.Close()
 
 	// 创建监听器
 	listener := newTestListener("test-service")
@@ -447,7 +462,7 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	provider := newTestServerInfoProvider("service1", "test-service", "v1.0.0")
 	err := discovery.Register(provider)
 	require.NoError(t, err)
-	provider.NtfUpdate()
+	//provider.NtfUpdate()
 	// 等待服务注册和扫描（扫描间隔为10秒）
 	// time.Sleep(11 * time.Second)
 	discovery.SyncServers()
@@ -461,13 +476,15 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	assert.Len(t, addEvents, 1)
 
 	// 更新服务版本
+	fmt.Println("provider update --------------------------")
 	listener.ClearEvents()
 	provider.UpdateVersion("v1.0.1")
 
 	// 等待服务更新到Redis和缓存刷新（定时更新5秒 + 扫描间隔10秒）
 	// time.Sleep(12 * time.Second)
 	provider.NtfUpdate()
-	discovery.SyncServers()
+	time.Sleep(time.Second)
+	//discovery.SyncServers()
 	// 验证服务版本已更新
 	info = discovery.GetServer("test-service", "service1")
 	assert.NotNil(t, info)
@@ -475,12 +492,13 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 
 	// 关闭服务
 	listener.ClearEvents()
+	fmt.Println("provider close --------------------------")
 	provider.Close()
 
 	// 等待服务清理（扫描间隔为10秒）
 	// time.Sleep(11 * time.Second)
-	discovery.SyncServers()
-
+	//discovery.SyncServers()
+	time.Sleep(time.Second)
 	// 验证服务已被移除
 	info = discovery.GetServer("test-service", "service1")
 	assert.Nil(t, info)
@@ -492,4 +510,86 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	// 验证监听器收到删除事件
 	removeEvents := listener.GetRemoveEvents()
 	assert.Len(t, removeEvents, 1)
+}
+
+// TestRedisDiscovery_PubSubNotification 测试Redis pub/sub通知功能
+func TestRedisDiscovery_PubSubNotification(t *testing.T) {
+	discovery1, client := setupTestDiscovery(t)
+	defer client.Close()
+	defer discovery1.Close()
+
+	// 创建第二个discovery实例来模拟分布式环境
+	marshaler := NewJSONMarshaler(func() ServerInfo {
+		return &testServerInfo{}
+	})
+	lg := logrus.New()
+	lg.SetLevel(logrus.DebugLevel)
+	discovery2 := NewRedisDiscovery(client, marshaler, lg)
+	defer discovery2.Close()
+
+	// 在discovery2上添加监听器
+	listener := newTestListener("test-service")
+	discovery2.AddListener(listener)
+
+	// 等待pub/sub连接建立
+	time.Sleep(100 * time.Millisecond)
+
+	// 在discovery1上注册服务（这会触发pub/sub通知）
+	provider := newTestServerInfoProvider("service1", "test-service", "v1.0.0")
+	defer provider.Close()
+	err := discovery1.Register(provider)
+	require.NoError(t, err)
+
+	// 等待pub/sub通知传播和处理
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证discovery2通过pub/sub通知感知到了服务变化
+	info := discovery2.GetServer("test-service", "service1")
+	assert.NotNil(t, info, "discovery2应该通过pub/sub通知感知到服务注册")
+	assert.Equal(t, "v1.0.0", info.Version())
+
+	// 验证监听器收到添加事件
+	addEvents := listener.GetAddEvents()
+	assert.Len(t, addEvents, 1, "监听器应该收到服务添加事件")
+	assert.Equal(t, "service1", addEvents[0].GetID())
+
+	// 测试服务注销的pub/sub通知
+	listener.ClearEvents()
+	provider.Close()
+
+	// 等待服务注销和pub/sub通知传播
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证discovery2感知到了服务移除
+	info = discovery2.GetServer("test-service", "service1")
+	assert.Nil(t, info, "discovery2应该通过pub/sub通知感知到服务注销")
+
+	// 验证监听器收到删除事件
+	removeEvents := listener.GetRemoveEvents()
+	assert.Len(t, removeEvents, 1, "监听器应该收到服务删除事件")
+	assert.Equal(t, "service1", removeEvents[0].GetID())
+}
+
+// TestRedisDiscovery_Close 测试Close方法
+func TestRedisDiscovery_Close(t *testing.T) {
+	discovery, client := setupTestDiscovery(t)
+	defer client.Close()
+
+	// 注册一个服务
+	provider := newTestServerInfoProvider("service1", "test-service", "v1.0.0")
+	defer provider.Close()
+	err := discovery.Register(provider)
+	require.NoError(t, err)
+
+	// 验证服务正常工作
+	localServices := discovery.LocalServers()
+	assert.Len(t, localServices, 1)
+
+	// 关闭discovery
+	err = discovery.Close()
+	assert.NoError(t, err, "Close方法应该成功执行")
+
+	// 再次调用Close应该不会出错
+	err = discovery.Close()
+	assert.NoError(t, err, "重复调用Close应该不会出错")
 }
