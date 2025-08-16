@@ -670,35 +670,20 @@ func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo) error {
 		return fmt.Errorf("marshal server info failed: %w", err)
 	}
 
-	// 存储到Redis Hash中
-	err = r.client.HSet(ctx, key, info.GetID(), data).Err()
+	// 使用pipeline合并写入和过期时间设置
+	pipe := r.client.Pipeline()
+	pipe.HSet(ctx, key, info.GetID(), data)
+	pipe.HExpire(ctx, key, r.expire, info.GetID())
+	// 执行pipeline
+	_, err = pipe.Exec(ctx)
 	if err != nil {
 		r.lg.WithFields(logrus.Fields{
 			"service_name": info.GetName(),
 			"service_id":   info.GetID(),
 			"redis_key":    key,
 			"error":        err,
-		}).Error("Redis HSET操作失败")
-		return fmt.Errorf("redis hset failed: %w", err)
-	}
-
-	r.lg.WithFields(logrus.Fields{
-		"service_name": info.GetName(),
-		"service_id":   info.GetID(),
-		"redis_key":    key,
-	}).Debug("服务信息已存储到Redis Hash")
-
-	// 设置过期时间
-	err = r.client.Expire(ctx, key, r.expire).Err()
-	if err != nil {
-		r.lg.WithFields(logrus.Fields{
-			"service_name": info.GetName(),
-			"service_id":   info.GetID(),
-			"redis_key":    key,
-			"expire_time":  r.expire,
-			"error":        err,
-		}).Error("设置Redis键过期时间失败")
-		return fmt.Errorf("redis expire failed: %w", err)
+		}).Error("Redis pipeline执行失败")
+		return fmt.Errorf("redis pipeline failed: %w", err)
 	}
 
 	r.lg.WithFields(logrus.Fields{
@@ -706,7 +691,7 @@ func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo) error {
 		"service_id":   info.GetID(),
 		"redis_key":    key,
 		"expire_time":  r.expire,
-	}).Debug("Redis键过期时间设置成功")
+	}).Debug("服务信息已更新到Redis")
 
 	// 发布服务变化通知
 	r.publishServiceChange(info.GetName(), "update")
