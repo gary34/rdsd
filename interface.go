@@ -8,16 +8,18 @@ type ServerInfo interface {
 	GetName() string
 	// LastUpdateTime 获取最后更新时间
 	LastUpdateTime() int64
-	//版本号
+	// Version 版本号
 	Version() string
+	// Clone 复制服务信息，防止外部修改
 	Clone() ServerInfo
 }
 
 type ServerInfoProvider interface {
-	// 获取最新的服务信息
+	// ServerInfo 获取最新的服务信息
 	ServerInfo() ServerInfo
-	// 服务信息关闭通道
+	// Done 服务信息关闭通道
 	Done() <-chan struct{}
+	// Update 服务信息更新通道
 	Update() <-chan ServerInfo
 }
 
@@ -33,7 +35,7 @@ type Discovery interface {
 	LocalServers() (list []ServerInfo)
 	// AddListener 添加服务变化监听器
 	AddListener(l Listener)
-	// 手动触发服务同步
+	// SyncServers 手动触发服务同步
 	SyncServers()
 	// Close 关闭服务发现，清理资源
 	Close() error

@@ -532,7 +532,7 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	discovery2.AddListener(listener)
 
 	// 等待pub/sub连接建立
-	time.Sleep(100 * time.Millisecond)
+	//time.Sleep(100 * time.Millisecond)
 
 	// 在discovery1上注册服务（这会触发pub/sub通知）
 	provider := newTestServerInfoProvider("service1", "test-service", "v1.0.0")
@@ -541,7 +541,7 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	require.NoError(t, err)
 
 	// 等待pub/sub通知传播和处理
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	// 验证discovery2通过pub/sub通知感知到了服务变化
 	info := discovery2.GetServer("test-service", "service1")
