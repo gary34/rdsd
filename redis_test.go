@@ -8,16 +8,17 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // 测试用的ServerInfo实现
 type testServerInfo struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	LastUpdate     int64  `json:"last_update_time"`
-	VersionNum     string `json:"version"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	LastUpdate int64  `json:"last_update_time"`
+	VersionNum string `json:"version"`
 }
 
 func (t *testServerInfo) GetID() string {
@@ -38,9 +39,10 @@ func (t *testServerInfo) Version() string {
 
 // 测试用的ServerInfoProvider实现
 type testServerInfoProvider struct {
-	info     *testServerInfo
-	doneChan chan struct{}
-	mutex    sync.RWMutex
+	info       *testServerInfo
+	doneChan   chan struct{}
+	updateChan chan ServerInfo
+	mutex      sync.RWMutex
 }
 
 func newTestServerInfoProvider(id, name, version string) *testServerInfoProvider {
@@ -51,10 +53,19 @@ func newTestServerInfoProvider(id, name, version string) *testServerInfoProvider
 			LastUpdate: time.Now().Unix(),
 			VersionNum: version,
 		},
-		doneChan: make(chan struct{}),
+		doneChan:   make(chan struct{}),
+		updateChan: make(chan ServerInfo),
 	}
 }
 
+func (t *testServerInfoProvider) Update() <-chan ServerInfo {
+	return t.updateChan
+}
+func (t *testServerInfoProvider) NtfUpdate() {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	t.updateChan <- t.info
+}
 func (t *testServerInfoProvider) ServerInfo() ServerInfo {
 	t.mutex.RLock()
 	defer t.mutex.RUnlock()
@@ -67,6 +78,7 @@ func (t *testServerInfoProvider) Done() <-chan struct{} {
 
 func (t *testServerInfoProvider) Close() {
 	close(t.doneChan)
+	// close(t.updateChan)
 }
 
 func (t *testServerInfoProvider) UpdateVersion(version string) {
@@ -78,17 +90,17 @@ func (t *testServerInfoProvider) UpdateVersion(version string) {
 
 // 测试用的Listener实现
 type testListener struct {
-	watchNames []string
-	addEvents  []ServerInfo
+	watchNames   []string
+	addEvents    []ServerInfo
 	removeEvents []ServerInfo
 	updateEvents []ServerInfo
-	mutex      sync.RWMutex
+	mutex        sync.RWMutex
 }
 
 func newTestListener(watchNames ...string) *testListener {
 	return &testListener{
-		watchNames: watchNames,
-		addEvents:  make([]ServerInfo, 0),
+		watchNames:   watchNames,
+		addEvents:    make([]ServerInfo, 0),
 		removeEvents: make([]ServerInfo, 0),
 		updateEvents: make([]ServerInfo, 0),
 	}
@@ -174,7 +186,10 @@ func setupTestDiscovery(t *testing.T) (*RedisDiscovery, *redis.Client) {
 	marshaler := NewJSONMarshaler(func() ServerInfo {
 		return &testServerInfo{}
 	})
-	discovery := NewRedisDiscovery(client, marshaler)
+	lg := logrus.New()
+	lg.SetReportCaller(true)
+	lg.SetLevel(logrus.DebugLevel)
+	discovery := NewRedisDiscovery(client, marshaler, lg)
 	return discovery, client
 }
 
@@ -235,8 +250,11 @@ func TestRedisDiscovery_GetServer(t *testing.T) {
 	err = client.HSet(ctx, key, "service1", data).Err()
 	require.NoError(t, err)
 
+	// 手动触发服务同步
+	discovery.SyncServers()
+
 	// 等待扫描器发现服务（扫描间隔为10秒）
-	time.Sleep(11 * time.Second)
+	// time.Sleep(11 * time.Second)
 
 	// 测试GetServer
 	info := discovery.GetServer("test-service", "service1")
@@ -285,8 +303,8 @@ func TestRedisDiscovery_GetServers(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// 等待扫描器发现服务（扫描间隔为10秒）
-	time.Sleep(11 * time.Second)
+	// 手动触发服务同步
+	discovery.SyncServers()
 
 	// 测试GetServers
 	services := discovery.GetServers("test-service")
@@ -375,8 +393,8 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 	require.NoError(t, err)
 
 	// 等待扫描器发现并通知（扫描间隔为10秒）
-	time.Sleep(11 * time.Second)
-
+	// time.Sleep(11 * time.Second)
+	discovery.SyncServers()
 	// 验证添加事件
 	addEvents := listener.GetAddEvents()
 	assert.Len(t, addEvents, 1)
@@ -429,8 +447,8 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	require.NoError(t, err)
 
 	// 等待服务注册和扫描（扫描间隔为10秒）
-	time.Sleep(11 * time.Second)
-
+	// time.Sleep(11 * time.Second)
+	discovery.SyncServers()
 	// 验证服务可以被获取
 	info := discovery.GetServer("test-service", "service1")
 	assert.NotNil(t, info)

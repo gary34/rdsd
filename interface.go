@@ -17,6 +17,7 @@ type ServerInfoProvider interface {
 	ServerInfo() ServerInfo
 	// 服务信息关闭通道
 	Done() <-chan struct{}
+	Update() <-chan ServerInfo
 }
 
 // Discovery 服务发现接口，提供服务注册、查询和监听功能
@@ -31,6 +32,8 @@ type Discovery interface {
 	LocalServers() (list []ServerInfo)
 	// AddListener 添加服务变化监听器
 	AddListener(l Listener)
+	// 手动触发服务同步
+	SyncServers()
 }
 
 // Listener 服务变化监听器接口，用于监听服务的添加和移除事件
