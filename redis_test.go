@@ -61,10 +61,12 @@ func newTestServerInfoProvider(id, name, version string) *testServerInfoProvider
 func (t *testServerInfoProvider) Update() <-chan ServerInfo {
 	return t.updateChan
 }
+
 func (t *testServerInfoProvider) NtfUpdate() {
 	t.mutex.RLock()
-	defer t.mutex.RUnlock()
 	t.updateChan <- t.info
+	t.mutex.RUnlock()
+	time.Sleep(time.Millisecond * 100)
 }
 func (t *testServerInfoProvider) ServerInfo() ServerInfo {
 	t.mutex.RLock()
@@ -445,7 +447,7 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	provider := newTestServerInfoProvider("service1", "test-service", "v1.0.0")
 	err := discovery.Register(provider)
 	require.NoError(t, err)
-
+	provider.NtfUpdate()
 	// 等待服务注册和扫描（扫描间隔为10秒）
 	// time.Sleep(11 * time.Second)
 	discovery.SyncServers()
@@ -463,8 +465,9 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	provider.UpdateVersion("v1.0.1")
 
 	// 等待服务更新到Redis和缓存刷新（定时更新5秒 + 扫描间隔10秒）
-	time.Sleep(12 * time.Second)
-
+	// time.Sleep(12 * time.Second)
+	provider.NtfUpdate()
+	discovery.SyncServers()
 	// 验证服务版本已更新
 	info = discovery.GetServer("test-service", "service1")
 	assert.NotNil(t, info)
@@ -475,7 +478,8 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	provider.Close()
 
 	// 等待服务清理（扫描间隔为10秒）
-	time.Sleep(11 * time.Second)
+	// time.Sleep(11 * time.Second)
+	discovery.SyncServers()
 
 	// 验证服务已被移除
 	info = discovery.GetServer("test-service", "service1")

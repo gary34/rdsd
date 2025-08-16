@@ -437,36 +437,13 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 
 		ticker := time.NewTicker(r.expire / 2) // 更新频率为过期时间的一半
 		defer ticker.Stop()
-		doupdate := func(currentInfo ServerInfo) {
-			if currentInfo != nil {
-				r.lg.WithFields(logrus.Fields{
-					"service_name": name,
-					"service_id":   id,
-					"version":      currentInfo.Version(),
-				}).Debug("定时更新服务信息到Redis")
-				err := r.updateServiceToRedis(currentInfo)
-				if err != nil {
-					r.lg.WithFields(logrus.Fields{
-						"service_name": name,
-						"service_id":   id,
-						"error":        err,
-					}).Error("定时更新服务信息到Redis失败")
-				} else {
-					// 更新本地缓存
-					r.lock.Lock()
-					r.localServices[name][id] = currentInfo
-					r.lock.Unlock()
-				}
-			}
-		}
 		for {
 			select {
 			case currentInfo := <-provider.Update():
-				doupdate(currentInfo)
+				_ = r.updateService(name, id, currentInfo)
 			case <-ticker.C:
 				// 定时更新服务信息到Redis
-				currentInfo := provider.ServerInfo()
-				doupdate(currentInfo)
+				_ = r.updateService(name, id, provider.ServerInfo())
 			case <-provider.Done():
 				// 服务关闭，清理资源
 				r.lg.WithFields(logrus.Fields{
@@ -497,6 +474,30 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 	return nil
 }
 
+func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
+	if info == nil {
+		return nil
+	}
+	r.lg.WithFields(logrus.Fields{
+		"service_name": name,
+		"service_id":   id,
+		"version":      info.Version(),
+	}).Debug("更新服务信息到Redis")
+	err := r.updateServiceToRedis(info)
+	if err != nil {
+		r.lg.WithFields(logrus.Fields{
+			"service_name": name,
+			"service_id":   id,
+			"error":        err,
+		}).Error("更新服务信息到Redis失败")
+	} else {
+		// 更新本地缓存
+		r.lock.Lock()
+		r.localServices[name][id] = info
+		r.lock.Unlock()
+	}
+	return nil
+}
 func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo) error {
 	key := fmt.Sprintf("rdsd:service:%s", info.GetName())
 	ctx := context.Background()
