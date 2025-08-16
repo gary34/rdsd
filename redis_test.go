@@ -212,6 +212,10 @@ func TestRedisDiscovery_GetServer(t *testing.T) {
 	discovery, client := setupTestDiscovery(t)
 	defer client.Close()
 
+	// 添加监听器以触发扫描
+	listener := newTestListener("test-service")
+	discovery.AddListener(listener)
+
 	// 直接向Redis写入测试数据
 	ctx := context.Background()
 	testInfo := &testServerInfo{
@@ -231,8 +235,8 @@ func TestRedisDiscovery_GetServer(t *testing.T) {
 	err = client.HSet(ctx, key, "service1", data).Err()
 	require.NoError(t, err)
 
-	// 等待扫描器发现服务
-	time.Sleep(1 * time.Second)
+	// 等待扫描器发现服务（扫描间隔为10秒）
+	time.Sleep(11 * time.Second)
 
 	// 测试GetServer
 	info := discovery.GetServer("test-service", "service1")
@@ -252,6 +256,10 @@ func TestRedisDiscovery_GetServer(t *testing.T) {
 func TestRedisDiscovery_GetServers(t *testing.T) {
 	discovery, client := setupTestDiscovery(t)
 	defer client.Close()
+
+	// 添加监听器以触发扫描
+	listener := newTestListener("test-service")
+	discovery.AddListener(listener)
 
 	// 直接向Redis写入多个测试数据
 	ctx := context.Background()
@@ -277,8 +285,8 @@ func TestRedisDiscovery_GetServers(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// 等待扫描器发现服务
-	time.Sleep(1 * time.Second)
+	// 等待扫描器发现服务（扫描间隔为10秒）
+	time.Sleep(11 * time.Second)
 
 	// 测试GetServers
 	services := discovery.GetServers("test-service")
@@ -366,8 +374,8 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 	err = client.HSet(ctx, key, "service1", data).Err()
 	require.NoError(t, err)
 
-	// 等待扫描器发现并通知
-	time.Sleep(1 * time.Second)
+	// 等待扫描器发现并通知（扫描间隔为10秒）
+	time.Sleep(11 * time.Second)
 
 	// 验证添加事件
 	addEvents := listener.GetAddEvents()
@@ -385,8 +393,8 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 	err = client.HSet(ctx, key, "service1", data).Err()
 	require.NoError(t, err)
 
-	// 等待扫描器发现更新
-	time.Sleep(1 * time.Second)
+	// 等待扫描器发现更新（扫描间隔为10秒）
+	time.Sleep(11 * time.Second)
 
 	// 验证更新事件
 	updateEvents := listener.GetUpdateEvents()
@@ -398,8 +406,8 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 	err = client.HDel(ctx, key, "service1").Err()
 	require.NoError(t, err)
 
-	// 等待扫描器发现删除
-	time.Sleep(1 * time.Second)
+	// 等待扫描器发现删除（扫描间隔为10秒）
+	time.Sleep(11 * time.Second)
 
 	// 验证删除事件
 	removeEvents := listener.GetRemoveEvents()
@@ -420,8 +428,8 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	err := discovery.Register(provider)
 	require.NoError(t, err)
 
-	// 等待服务注册和扫描
-	time.Sleep(1 * time.Second)
+	// 等待服务注册和扫描（扫描间隔为10秒）
+	time.Sleep(11 * time.Second)
 
 	// 验证服务可以被获取
 	info := discovery.GetServer("test-service", "service1")
@@ -436,8 +444,8 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	listener.ClearEvents()
 	provider.UpdateVersion("v1.0.1")
 
-	// 等待服务更新
-	time.Sleep(3 * time.Second) // 等待定时更新
+	// 等待服务更新到Redis和缓存刷新（定时更新5秒 + 扫描间隔10秒）
+	time.Sleep(12 * time.Second)
 
 	// 验证服务版本已更新
 	info = discovery.GetServer("test-service", "service1")
@@ -448,8 +456,8 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	listener.ClearEvents()
 	provider.Close()
 
-	// 等待服务清理
-	time.Sleep(1 * time.Second)
+	// 等待服务清理（扫描间隔为10秒）
+	time.Sleep(11 * time.Second)
 
 	// 验证服务已被移除
 	info = discovery.GetServer("test-service", "service1")
