@@ -51,9 +51,9 @@ func (j *jsonMarshaller) Unmarshal(data []byte) (v ServerInfo, err error) {
 var _ Discovery = (*RedisDiscovery)(nil)
 
 type RedisDiscovery struct {
-	client    *redis.Client
+	client    redis.UniversalClient
 	marshaler Marshaller
-	lg        *logrus.Logger
+	lg        *logrus.Entry
 	closeOnce sync.Once
 
 	// 统一的读写锁
@@ -81,7 +81,7 @@ func (r *RedisDiscovery) SyncServers() {
 	r.scanServers()
 }
 
-func NewRedisDiscovery(client *redis.Client, marshaler Marshaller, lg *logrus.Logger) *RedisDiscovery {
+func NewRedisDiscovery(client redis.UniversalClient, marshaler Marshaller, lg *logrus.Entry) *RedisDiscovery {
 
 	lg.Info("开始创建RedisDiscovery实例")
 
@@ -400,7 +400,7 @@ func (r *RedisDiscovery) scanServiceByName(name string, listeners []Listener) {
 				listener.OnAdd(info)
 			}
 			addCount++
-		} else if info != oldCache[id] {
+		} else if info.GetVersion() != oldCache[id].GetVersion() {
 			// 服务更新
 			r.lg.WithFields(logrus.Fields{
 				"service_name": name,
@@ -562,9 +562,9 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 	if r.providers[name] == nil {
 		r.providers[name] = make(map[string]ServerInfoProvider)
 	}
-
+	info = info.Clone()
 	// 保存本地服务信息和提供者
-	r.localServices[name][id] = info.Clone()
+	r.localServices[name][id] = info
 	r.providers[name][id] = provider
 	r.lock.Unlock()
 
@@ -574,7 +574,7 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 	}).Debug("服务信息已保存到本地缓存")
 
 	// 立即注册一次
-	err = r.updateServiceToRedis(info)
+	err = r.updateServiceToRedis(info, true)
 	if err != nil {
 		r.lg.WithFields(logrus.Fields{
 			"service_name": name,
@@ -598,10 +598,10 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 		for {
 			select {
 			case currentInfo := <-provider.Update():
-				_ = r.updateService(name, id, currentInfo)
+				_ = r.updateService(name, id, currentInfo.Clone())
 			case <-ticker.C:
 				// 定时更新服务信息到Redis
-				_ = r.updateService(name, id, provider.ServerInfo())
+				_ = r.updateService(name, id, provider.ServerInfo().Clone())
 			case <-provider.Done():
 				// 服务关闭，清理资源
 				r.lg.WithFields(logrus.Fields{
@@ -627,18 +627,18 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 	}
 	// 更新本地缓存
 	r.lock.Lock()
-	if r.localServices[name][id].GetVersion() == info.GetVersion() {
-		r.lock.Unlock()
-		return nil
-	}
-	r.localServices[name][id] = info.Clone()
+	oldVersion := r.localServices[name][id].GetVersion()
+	versionChange := oldVersion != info.GetVersion()
+	r.localServices[name][id] = info
 	r.lock.Unlock()
 	r.lg.WithFields(logrus.Fields{
-		"service_name": name,
-		"service_id":   id,
-		"version":      info.GetVersion(),
+		"service_name":   name,
+		"service_id":     id,
+		"old_version":    oldVersion,
+		"version":        info.GetVersion(),
+		"version_change": versionChange,
 	}).Debug("更新服务信息到Redis")
-	err := r.updateServiceToRedis(info)
+	err := r.updateServiceToRedis(info, versionChange)
 	if err != nil {
 		r.lg.WithFields(logrus.Fields{
 			"service_name": name,
@@ -648,10 +648,13 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 	}
 	return nil
 }
-func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo) error {
+func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo, versionChange bool) error {
 	key := fmt.Sprintf("rdsd:service:%s", info.GetName())
 	ctx := context.Background()
-
+	if !versionChange {
+		r.client.HExpire(ctx, key, r.expire, info.GetID())
+		return nil
+	}
 	r.lg.WithFields(logrus.Fields{
 		"service_name": info.GetName(),
 		"service_id":   info.GetID(),

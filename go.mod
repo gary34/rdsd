@@ -1,6 +1,6 @@
-module rdsd
+module github/gary34/rdsd
 
-go 1.24.3
+go 1.24
 
 require (
 	github.com/redis/go-redis/v9 v9.12.1

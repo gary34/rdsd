@@ -205,7 +205,7 @@ func setupTestDiscovery(t *testing.T) (*RedisDiscovery, *redis.Client) {
 	lg := logrus.New()
 	lg.SetReportCaller(true)
 	lg.SetLevel(logrus.DebugLevel)
-	discovery := NewRedisDiscovery(client, marshaler, lg)
+	discovery := NewRedisDiscovery(client, marshaler, logrus.NewEntry(lg))
 	return discovery, client
 }
 
@@ -524,7 +524,7 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	})
 	lg := logrus.New()
 	lg.SetLevel(logrus.DebugLevel)
-	discovery2 := NewRedisDiscovery(client, marshaler, lg)
+	discovery2 := NewRedisDiscovery(client, marshaler, logrus.NewEntry(lg))
 	defer discovery2.Close()
 
 	// 在discovery2上添加监听器
