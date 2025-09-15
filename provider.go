@@ -1,4 +1,4 @@
-package rdsd
+package ebsd
 
 import (
 	"sync"

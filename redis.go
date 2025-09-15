@@ -1,8 +1,7 @@
-package rdsd
+package ebsd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -10,36 +9,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 )
-
-type Marshaller interface {
-	Marshal(v ServerInfo) ([]byte, error)
-	Unmarshal(data []byte) (v ServerInfo, err error)
-}
-
-func NewJSONMarshaller(infoMaker func() ServerInfo) Marshaller {
-	return &jsonMarshaller{
-		infoMaker: infoMaker,
-	}
-}
-
-type jsonMarshaller struct {
-	infoMaker func() ServerInfo
-}
-
-// 实现 Marshaller 接口
-
-func (j *jsonMarshaller) Marshal(v ServerInfo) ([]byte, error) {
-	return json.Marshal(v)
-}
-
-func (j *jsonMarshaller) Unmarshal(data []byte) (v ServerInfo, err error) {
-	if j.infoMaker == nil {
-		return nil, fmt.Errorf("infoMaker is nil")
-	}
-	v = j.infoMaker()
-	err = json.Unmarshal(data, v)
-	return
-}
 
 // 实现 Discovery 接口
 // 使用redis.hash 存储服务信息。key: rdsd:service:name, field: id, value: json, 并设置5秒的过期时间
@@ -55,7 +24,7 @@ type RedisDiscovery struct {
 	marshaler Marshaller
 	lg        *logrus.Entry
 	closeOnce sync.Once
-
+	done      chan struct{}
 	// 统一的读写锁
 	lock sync.RWMutex
 	// 过期时间
@@ -82,7 +51,6 @@ func (r *RedisDiscovery) SyncServers() {
 }
 
 func NewRedisDiscovery(client redis.UniversalClient, marshaler Marshaller, lg *logrus.Entry) *RedisDiscovery {
-
 	lg.Info("开始创建RedisDiscovery实例")
 
 	subCtx, subCancel := context.WithCancel(context.Background())
@@ -97,6 +65,7 @@ func NewRedisDiscovery(client redis.UniversalClient, marshaler Marshaller, lg *l
 		providers:     make(map[string]map[string]ServerInfoProvider),
 		subCtx:        subCtx,
 		subCancel:     subCancel,
+		done:          make(chan struct{}),
 	}
 
 	r.lg.WithFields(logrus.Fields{
@@ -182,7 +151,7 @@ func (r *RedisDiscovery) scanServers() {
 		r.scanServiceByName(name, listeners)
 	}
 
-	r.lg.Info("服务扫描完成")
+	r.lg.Debug("服务扫描完成")
 }
 
 func (r *RedisDiscovery) key(name string) string {
@@ -300,6 +269,7 @@ func (r *RedisDiscovery) Close() error {
 		if r.subCancel != nil {
 			r.subCancel()
 		}
+		close(r.done)
 		// 关闭pub/sub连接
 		if r.pubsub != nil {
 			err = r.pubsub.Close()
@@ -307,7 +277,7 @@ func (r *RedisDiscovery) Close() error {
 				r.lg.WithFields(logrus.Fields{
 					"error": err,
 				}).Error("关闭pub/sub连接失败")
-				//return err
+				// return err
 				return
 			}
 		}
@@ -562,9 +532,9 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 	if r.providers[name] == nil {
 		r.providers[name] = make(map[string]ServerInfoProvider)
 	}
-	info = info.Clone()
+
 	// 保存本地服务信息和提供者
-	r.localServices[name][id] = info
+	r.localServices[name][id] = info.Clone()
 	r.providers[name][id] = provider
 	r.lock.Unlock()
 
@@ -594,21 +564,26 @@ func (r *RedisDiscovery) Register(provider ServerInfoProvider) (err error) {
 		}).Debug("启动服务定时更新协程")
 		wg.Done()
 		ticker := time.NewTicker(r.expire / 2) // 更新频率为过期时间的一半
-		defer ticker.Stop()
+		defer func() {
+			ticker.Stop()
+			// 服务关闭，清理资源
+			r.lg.WithFields(logrus.Fields{
+				"service_name": name,
+				"service_id":   id,
+			}).Info("服务提供者关闭，开始清理资源")
+			r.unregisterService(name, id)
+		}()
 		for {
 			select {
 			case currentInfo := <-provider.Update():
-				_ = r.updateService(name, id, currentInfo.Clone())
+				_ = r.updateService(name, id, currentInfo)
 			case <-ticker.C:
 				// 定时更新服务信息到Redis
-				_ = r.updateService(name, id, provider.ServerInfo().Clone())
+				_ = r.updateService(name, id, provider.ServerInfo())
 			case <-provider.Done():
-				// 服务关闭，清理资源
-				r.lg.WithFields(logrus.Fields{
-					"service_name": name,
-					"service_id":   id,
-				}).Info("服务提供者关闭，开始清理资源")
-				r.unregisterService(name, id)
+				r.lg.WithField("name", name).Info("provider 主动关闭")
+				return
+			case <-r.done:
 				return
 			}
 		}
@@ -627,16 +602,13 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 	}
 	// 更新本地缓存
 	r.lock.Lock()
-	oldVersion := r.localServices[name][id].GetVersion()
-	versionChange := oldVersion != info.GetVersion()
-	r.localServices[name][id] = info
+	versionChange := r.localServices[name][id].GetVersion() == info.GetVersion()
+	r.localServices[name][id] = info.Clone()
 	r.lock.Unlock()
 	r.lg.WithFields(logrus.Fields{
-		"service_name":   name,
-		"service_id":     id,
-		"old_version":    oldVersion,
-		"version":        info.GetVersion(),
-		"version_change": versionChange,
+		"service_name": name,
+		"service_id":   id,
+		"version":      info.GetVersion(),
 	}).Debug("更新服务信息到Redis")
 	err := r.updateServiceToRedis(info, versionChange)
 	if err != nil {
@@ -648,13 +620,11 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 	}
 	return nil
 }
+
 func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo, versionChange bool) error {
 	key := fmt.Sprintf("rdsd:service:%s", info.GetName())
 	ctx := context.Background()
-	if !versionChange {
-		r.client.HExpire(ctx, key, r.expire, info.GetID())
-		return nil
-	}
+
 	r.lg.WithFields(logrus.Fields{
 		"service_name": info.GetName(),
 		"service_id":   info.GetID(),
@@ -697,7 +667,9 @@ func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo, versionChange boo
 	}).Debug("服务信息已更新到Redis")
 
 	// 发布服务变化通知
-	r.publishServiceChange(info.GetName(), "update")
+	if versionChange {
+		r.publishServiceChange(info.GetName(), "update")
+	}
 
 	return nil
 }

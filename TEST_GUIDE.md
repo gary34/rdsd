@@ -6,6 +6,10 @@
 
 ## 测试文件结构
 
+```shell
+docker run  -d --rm -p 2379:2379 -e ALLOW_NONE_AUTHENTICATION=yes -d etcd:3.5
+docker run  -d --rm -p 6379:6379 -d redis:8.0
+```
 ### redis_test.go
 
 包含以下测试组件：

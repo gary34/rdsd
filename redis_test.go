@@ -1,4 +1,4 @@
-package rdsd
+package ebsd
 
 import (
 	"context"
@@ -78,6 +78,7 @@ func (t *testServerInfoProvider) NtfUpdate() {
 	t.mutex.RUnlock()
 	time.Sleep(time.Millisecond * 100)
 }
+
 func (t *testServerInfoProvider) ServerInfo() ServerInfo {
 	t.mutex.RLock()
 	defer t.mutex.RUnlock()
@@ -202,10 +203,12 @@ func setupTestDiscovery(t *testing.T) (*RedisDiscovery, *redis.Client) {
 	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
 	})
-	lg := logrus.New()
-	lg.SetReportCaller(true)
-	lg.SetLevel(logrus.DebugLevel)
-	discovery := NewRedisDiscovery(client, marshaler, logrus.NewEntry(lg))
+	// lg := logrus.New()
+	// lg.SetReportCaller(true)
+	// lg.SetLevel(logrus.DebugLevel)
+	lg := logrus.NewEntry(logrus.New())
+	lg.Level = logrus.DebugLevel
+	discovery := NewRedisDiscovery(client, marshaler, lg)
 	return discovery, client
 }
 
@@ -233,7 +236,7 @@ func TestRedisDiscovery_Register(t *testing.T) {
 
 	// 验证Redis中的数据
 	ctx := context.Background()
-	key := "rdsd:service:test-service"
+	key := "ebsd:service:test-service"
 	result, err := client.HGet(ctx, key, "service1").Result()
 	require.NoError(t, err)
 	assert.NotEmpty(t, result)
@@ -262,7 +265,7 @@ func TestRedisDiscovery_GetServer(t *testing.T) {
 	data, err := marshaler.Marshal(testInfo)
 	require.NoError(t, err)
 
-	key := "rdsd:service:test-service"
+	key := "ebsd:service:test-service"
 	err = client.HSet(ctx, key, "service1", data).Err()
 	require.NoError(t, err)
 
@@ -297,7 +300,7 @@ func TestRedisDiscovery_GetServers(t *testing.T) {
 
 	// 直接向Redis写入多个测试数据
 	ctx := context.Background()
-	key := "rdsd:service:test-service"
+	key := "ebsd:service:test-service"
 
 	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
@@ -391,7 +394,7 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 
 	// 直接向Redis添加服务
 	ctx := context.Background()
-	key := "rdsd:service:test-service"
+	key := "ebsd:service:test-service"
 
 	testInfo := &testServerInfo{
 		ID:         "service1",
@@ -462,7 +465,7 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	provider := newTestServerInfoProvider("service1", "test-service", "v1.0.0")
 	err := discovery.Register(provider)
 	require.NoError(t, err)
-	//provider.NtfUpdate()
+	// provider.NtfUpdate()
 	// 等待服务注册和扫描（扫描间隔为10秒）
 	// time.Sleep(11 * time.Second)
 	discovery.SyncServers()
@@ -484,7 +487,7 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 	// time.Sleep(12 * time.Second)
 	provider.NtfUpdate()
 	time.Sleep(time.Second)
-	//discovery.SyncServers()
+	// discovery.SyncServers()
 	// 验证服务版本已更新
 	info = discovery.GetServer("test-service", "service1")
 	assert.NotNil(t, info)
@@ -497,7 +500,7 @@ func TestRedisDiscovery_ServiceLifecycle(t *testing.T) {
 
 	// 等待服务清理（扫描间隔为10秒）
 	// time.Sleep(11 * time.Second)
-	//discovery.SyncServers()
+	// discovery.SyncServers()
 	time.Sleep(time.Second)
 	// 验证服务已被移除
 	info = discovery.GetServer("test-service", "service1")
@@ -522,9 +525,9 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
 	})
-	lg := logrus.New()
-	lg.SetLevel(logrus.DebugLevel)
-	discovery2 := NewRedisDiscovery(client, marshaler, logrus.NewEntry(lg))
+	lg := logrus.NewEntry(logrus.New())
+	lg.Level = logrus.DebugLevel
+	discovery2 := NewRedisDiscovery(client, marshaler, lg)
 	defer discovery2.Close()
 
 	// 在discovery2上添加监听器
@@ -532,7 +535,7 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	discovery2.AddListener(listener)
 
 	// 等待pub/sub连接建立
-	//time.Sleep(100 * time.Millisecond)
+	// time.Sleep(100 * time.Millisecond)
 
 	// 在discovery1上注册服务（这会触发pub/sub通知）
 	provider := newTestServerInfoProvider("service1", "test-service", "v1.0.0")

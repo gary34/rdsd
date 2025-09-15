@@ -1,4 +1,39 @@
-package rdsd
+package ebsd
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type Marshaller interface {
+	Marshal(v ServerInfo) ([]byte, error)
+	Unmarshal(data []byte) (v ServerInfo, err error)
+}
+
+func NewJSONMarshaller(infoMaker func() ServerInfo) Marshaller {
+	return &jsonMarshaller{
+		infoMaker: infoMaker,
+	}
+}
+
+type jsonMarshaller struct {
+	infoMaker func() ServerInfo
+}
+
+// 实现 Marshaller 接口
+
+func (j *jsonMarshaller) Marshal(v ServerInfo) ([]byte, error) {
+	return json.Marshal(v)
+}
+
+func (j *jsonMarshaller) Unmarshal(data []byte) (v ServerInfo, err error) {
+	if j.infoMaker == nil {
+		return nil, fmt.Errorf("infoMaker is nil")
+	}
+	v = j.infoMaker()
+	err = json.Unmarshal(data, v)
+	return
+}
 
 // ServerInfo 服务信息接口
 type ServerInfo interface {
@@ -25,15 +60,15 @@ type ServerInfoProvider interface {
 
 // Discovery 服务发现接口，提供服务注册、查询和监听功能
 type Discovery interface {
-	// GetServer 根据服务名称和ID获取指定的服务信息
+	// GetServer 根据服务名称和ID获取指定的服务信息. 只有通过AddListener的才能获取到
 	GetServer(name, id string) (info ServerInfo)
-	// GetServers 根据服务名称获取所有相关的服务列表
+	// GetServers 根据服务名称获取所有相关的服务列表. 只有通过AddListener的才能获取到
 	GetServers(name string) (list []ServerInfo)
 	// Register 注册服务信息到发现服务中
 	Register(provider ServerInfoProvider) (err error)
 	// LocalServers 获取通过Register注册的本地服务信息
 	LocalServers() (list []ServerInfo)
-	// AddListener 添加服务变化监听器
+	// AddListener 添加服务监听器
 	AddListener(l Listener)
 	// SyncServers 手动触发服务同步
 	SyncServers()
