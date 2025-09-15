@@ -52,8 +52,22 @@ func setupTestEtcdDiscovery(t *testing.T) (*EtcdDiscovery, *clientv3.Client) {
 	logger := logrus.NewEntry(logrus.StandardLogger())
 	logger.Logger.SetLevel(logrus.DebugLevel)
 
-	discovery := NewEtcdDiscovery(client, marshaler, logger)
+	discovery := NewEtcdDiscovery(client, marshaler, "/rdsd", logger)
 	return discovery, client
+}
+
+// 测试租约过期
+func TestEtcdDiscovery_Lease(t *testing.T) {
+	discovery, client := setupTestEtcdDiscovery(t)
+	defer client.Close()
+	defer discovery.Close()
+	// 创建测试服务提供者
+	provider := newTestServerInfoProvider("server1", "test-service", "v1.0")
+	defer provider.Close()
+	// 注册服务
+	err := discovery.Register(provider)
+	require.NoError(t, err)
+	time.Sleep(time.Hour)
 }
 
 func TestEtcdDiscovery_Register(t *testing.T) {
@@ -91,10 +105,6 @@ func TestEtcdDiscovery_GetServer(t *testing.T) {
 	defer client.Close()
 	defer discovery.Close()
 
-	// 创建监听器
-	listener := newTestListener("test-service")
-	discovery.AddListener(listener)
-
 	// 等待监听器初始化
 	time.Sleep(100 * time.Millisecond)
 
@@ -105,7 +115,7 @@ func TestEtcdDiscovery_GetServer(t *testing.T) {
 	require.NoError(t, err)
 
 	// 等待服务注册和watch事件处理
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(time.Second)
 
 	// 测试获取服务
 	server := discovery.GetServer("test-service", "server1")
@@ -128,12 +138,12 @@ func TestEtcdDiscovery_GetServers(t *testing.T) {
 	defer client.Close()
 	defer discovery.Close()
 
-	// 创建监听器
-	listener := newTestListener("test-service")
-	discovery.AddListener(listener)
+	//// 创建监听器
+	//listener := newTestListener("test-service")
+	//discovery.AddListener(listener)
 
 	// 等待监听器初始化
-	time.Sleep(100 * time.Millisecond)
+	//time.Sleep(100 * time.Millisecond)
 
 	// 注册多个服务
 	provider1 := newTestServerInfoProvider("server1", "test-service", "v1.0")
@@ -151,7 +161,7 @@ func TestEtcdDiscovery_GetServers(t *testing.T) {
 	require.NoError(t, err)
 
 	// 等待服务注册和watch事件处理
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	// 测试获取test-service的所有服务
 	servers := discovery.GetServers("test-service")
@@ -207,10 +217,12 @@ func TestEtcdDiscovery_AddListener(t *testing.T) {
 	discovery, client := setupTestEtcdDiscovery(t)
 	defer client.Close()
 	defer discovery.Close()
-
+	discovery1, _ := setupTestEtcdDiscovery(t)
+	//defer client.Close()
+	defer discovery1.Close()
 	// 创建监听器
 	listener := newTestListener("test-service")
-	discovery.AddListener(listener)
+	discovery1.AddListener(listener)
 
 	// 等待监听器初始化
 	time.Sleep(100 * time.Millisecond)

@@ -3,6 +3,7 @@ package rdsd
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,9 +21,32 @@ import (
 
 var _ Discovery = (*EtcdDiscovery)(nil)
 
+type serverCaches map[string]map[string]ServerInfo
+
+func (cs serverCaches) Compare(cs1 serverCaches) (changes serverChanges) {
+	for name, ids := range cs {
+		for id, info := range ids {
+			if _, ok := cs1[name][id]; !ok {
+				changes.delete = append(changes.delete, info)
+			}
+		}
+	}
+	for name, ids := range cs1 {
+		for id, info := range ids {
+			if oldInfo, ok := cs[name][id]; !ok {
+				changes.add = append(changes.add, info)
+			} else if oldInfo.GetVersion() != info.GetVersion() {
+				changes.update = append(changes.update, info)
+			}
+		}
+	}
+	return
+}
+
 type EtcdDiscovery struct {
 	client    *clientv3.Client
 	marshaler Marshaller
+	prefix    string
 	lg        *logrus.Entry
 	closeOnce sync.Once
 	done      chan struct{}
@@ -33,18 +57,24 @@ type EtcdDiscovery struct {
 	// 监听器列表
 	listeners []Listener
 	// 本地缓存的服务信息 map[serviceName]map[serviceID]ServerInfo
-	cache map[string]map[string]ServerInfo
+	cache serverCaches
 	// 本地注册的服务信息 map[serviceName]map[serviceID]ServerInfo
 	localServices map[string]map[string]ServerInfoProvider
-	// 服务对应的lease ID map[serviceName]map[serviceID]clientv3.LeaseID
-	leases map[string]map[string]clientv3.LeaseID
+	localIDs      map[string]struct{}
+	// 统一的lease ID，所有服务共享
+	globalLease clientv3.LeaseID
+	// lease是否已创建
+	leaseCreated bool
 	// watch相关
 	watchCtx    context.Context
 	watchCancel context.CancelFunc
 }
 
 // NewEtcdDiscovery 创建基于etcd的服务发现实例
-func NewEtcdDiscovery(client *clientv3.Client, marshaler Marshaller, lg *logrus.Entry) *EtcdDiscovery {
+func NewEtcdDiscovery(client *clientv3.Client, marshaler Marshaller, prefix string, lg *logrus.Entry) *EtcdDiscovery {
+	if prefix == "" {
+		prefix = "/rdsd"
+	}
 	if lg == nil {
 		lg = logrus.NewEntry(logrus.StandardLogger())
 	}
@@ -54,13 +84,16 @@ func NewEtcdDiscovery(client *clientv3.Client, marshaler Marshaller, lg *logrus.
 	d := &EtcdDiscovery{
 		client:        client,
 		marshaler:     marshaler,
+		prefix:        prefix,
 		lg:            lg.WithField("component", "etcd-discovery"),
 		done:          make(chan struct{}),
-		leaseTTL:      5, // 5秒TTL
+		leaseTTL:      10, // 5秒TTL
 		listeners:     make([]Listener, 0),
-		cache:         make(map[string]map[string]ServerInfo),
+		cache:         make(serverCaches),
 		localServices: make(map[string]map[string]ServerInfoProvider),
-		leases:        make(map[string]map[string]clientv3.LeaseID),
+		localIDs:      make(map[string]struct{}),
+		globalLease:   0, // 初始化为0，表示未创建
+		leaseCreated:  false,
 		watchCtx:      watchCtx,
 		watchCancel:   watchCancel,
 	}
@@ -73,20 +106,27 @@ func NewEtcdDiscovery(client *clientv3.Client, marshaler Marshaller, lg *logrus.
 
 // serviceKey 生成服务在etcd中的key
 func (e *EtcdDiscovery) serviceKey(name, id string) string {
-	return fmt.Sprintf("/rdsd/service/%s/%s", name, id)
+	//return fmt.Sprintf(e.prefix+"/service/%s/%s", name, id)
+	return e.servicePrefix(name) + "/" + id
 }
 
 // servicePrefix 生成服务名称的前缀
 func (e *EtcdDiscovery) servicePrefix(name string) string {
-	return fmt.Sprintf("/rdsd/service/%s/", name)
+	return e.serviceAllPrefix() + "/" + name
+}
+
+// serviceAllPrefix 生成服务名称的前缀
+func (e *EtcdDiscovery) serviceAllPrefix() string {
+	return e.prefix + "/service"
 }
 
 // parseServiceKey 解析服务key，返回服务名和ID
 func (e *EtcdDiscovery) parseServiceKey(key string) (name, id string, ok bool) {
-	if !strings.HasPrefix(key, "/rdsd/service/") {
+	prefix := e.serviceAllPrefix()
+	if !strings.HasPrefix(key, prefix) {
 		return "", "", false
 	}
-	parts := strings.Split(strings.TrimPrefix(key, "/rdsd/service/"), "/")
+	parts := strings.Split(strings.TrimPrefix(key, prefix+"/"), "/")
 	if len(parts) != 2 {
 		return "", "", false
 	}
@@ -101,7 +141,7 @@ func (e *EtcdDiscovery) startWatcher() {
 		}
 	}()
 
-	watchChan := e.client.Watch(e.watchCtx, "/rdsd/service/", clientv3.WithPrefix())
+	watchChan := e.client.Watch(e.watchCtx, e.prefix+"/service/", clientv3.WithPrefix())
 
 	for {
 		select {
@@ -120,13 +160,69 @@ func (e *EtcdDiscovery) startWatcher() {
 	}
 }
 
+type serverChanges struct {
+	delete []ServerInfo
+	add    []ServerInfo
+	update []ServerInfo
+}
+
+func (b serverChanges) notifyListeners(listeners []Listener) {
+	if len(listeners) == 0 {
+		return
+	}
+	namesByWatch := make(map[string][]Listener)
+	for _, listener := range listeners {
+		for _, watchName := range listener.WatchNames() {
+			namesByWatch[watchName] = append(namesByWatch[watchName], listener)
+		}
+	}
+	for _, info := range b.add {
+		for _, l := range namesByWatch[info.GetName()] {
+			l.OnAdd(info)
+		}
+	}
+	for _, info := range b.update {
+		for _, l := range namesByWatch[info.GetName()] {
+			l.OnUpdate(info)
+		}
+	}
+	for _, info := range b.delete {
+		for _, l := range namesByWatch[info.GetName()] {
+			l.OnRemove(info)
+		}
+	}
+}
+
+func (e *EtcdDiscovery) ntfChange(buff serverChanges) {
+	e.lock.RLock()
+	ls := make([]Listener, len(e.listeners))
+	copy(ls, e.listeners)
+	buff.add = slices.DeleteFunc(buff.add, func(info ServerInfo) bool {
+		_, ok := e.localIDs[info.GetID()]
+		return ok
+	})
+	buff.update = slices.DeleteFunc(buff.update, func(info ServerInfo) bool {
+		_, ok := e.localIDs[info.GetID()]
+		return ok
+	})
+	buff.delete = slices.DeleteFunc(buff.delete, func(info ServerInfo) bool {
+		_, ok := e.localIDs[info.GetID()]
+		return ok
+	})
+	e.lock.RUnlock()
+	go buff.notifyListeners(ls)
+}
+
 // handleWatchEvent 处理watch事件
 func (e *EtcdDiscovery) handleWatchEvent(event *clientv3.Event) {
 	name, id, ok := e.parseServiceKey(string(event.Kv.Key))
 	if !ok {
 		return
 	}
-
+	var changes serverChanges
+	defer func() {
+		e.ntfChange(changes)
+	}()
 	e.lock.Lock()
 	defer e.lock.Unlock()
 
@@ -142,47 +238,25 @@ func (e *EtcdDiscovery) handleWatchEvent(event *clientv3.Event) {
 				return
 			}
 		}
-
 		// 更新缓存
 		if e.cache[name] == nil {
 			e.cache[name] = make(map[string]ServerInfo)
 		}
 		_, exists := e.cache[name][id]
-		e.cache[name][id] = info
-
-		// 通知监听器
-		for _, listener := range e.listeners {
-			watchNames := listener.WatchNames()
-			for _, watchName := range watchNames {
-				if watchName == name {
-					if exists {
-						listener.OnUpdate(info)
-					} else {
-						listener.OnAdd(info)
-					}
-					break
-				}
-			}
+		if exists {
+			changes.update = append(changes.update, info)
+		} else {
+			changes.add = append(changes.add, info)
 		}
-
+		e.cache[name][id] = info
 	case clientv3.EventTypeDelete:
 		// 服务删除
 		if e.cache[name] != nil {
 			if info, exists := e.cache[name][id]; exists {
 				delete(e.cache[name], id)
+				changes.delete = append(changes.delete, info)
 				if len(e.cache[name]) == 0 {
 					delete(e.cache, name)
-				}
-
-				// 通知监听器
-				for _, listener := range e.listeners {
-					watchNames := listener.WatchNames()
-					for _, watchName := range watchNames {
-						if watchName == name {
-							listener.OnRemove(info)
-							break
-						}
-					}
 				}
 			}
 		}
@@ -232,76 +306,41 @@ func (e *EtcdDiscovery) LocalServers() (list []ServerInfo) {
 func (e *EtcdDiscovery) AddListener(l Listener) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
-
 	e.listeners = append(e.listeners, l)
-
-	// 为新监听器同步当前缓存的服务
-	watchNames := l.WatchNames()
-	for _, name := range watchNames {
-		if serviceMap, exists := e.cache[name]; exists {
-			for _, info := range serviceMap {
-				l.OnAdd(info)
-			}
-		} else {
-			// 如果缓存中没有，从etcd同步
-			go e.syncServiceByName(name)
-		}
-	}
 }
 
-// syncServiceByName 同步指定服务名的所有服务信息
-func (e *EtcdDiscovery) syncServiceByName(name string) {
+// SyncServers 手动触发服务同步
+func (e *EtcdDiscovery) SyncServers() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := e.client.Get(ctx, e.servicePrefix(name), clientv3.WithPrefix())
+	resp, err := e.client.Get(ctx, e.serviceAllPrefix(), clientv3.WithPrefix())
 	if err != nil {
-		e.lg.Errorf("sync service %s error: %v", name, err)
+		e.lg.WithError(err).Error("sync error")
 		return
 	}
-
-	e.lock.Lock()
-	defer e.lock.Unlock()
-
-	if e.cache[name] == nil {
-		e.cache[name] = make(map[string]ServerInfo)
-	}
-
+	cs := make(serverCaches)
 	for _, kv := range resp.Kvs {
 		_, id, ok := e.parseServiceKey(string(kv.Key))
 		if !ok {
 			continue
 		}
-
-		info, err := e.marshaler.Unmarshal(kv.Value)
-		if err != nil {
-			e.lg.Errorf("unmarshal server info error: %v", err)
+		info, uerr := e.marshaler.Unmarshal(kv.Value)
+		if uerr != nil {
+			e.lg.WithError(err).Error("unmarshal server info error")
 			continue
 		}
-
-		e.cache[name][id] = info
-	}
-}
-
-// SyncServers 手动触发服务同步
-func (e *EtcdDiscovery) SyncServers() {
-	e.lock.RLock()
-	listeners := make([]Listener, len(e.listeners))
-	copy(listeners, e.listeners)
-	e.lock.RUnlock()
-
-	// 收集所有需要监听的服务名
-	watchNamesSet := make(map[string]bool)
-	for _, listener := range listeners {
-		for _, name := range listener.WatchNames() {
-			watchNamesSet[name] = true
+		name := info.GetName()
+		if cs[name] == nil {
+			cs[name] = make(map[string]ServerInfo)
 		}
+		cs[name][id] = info
 	}
-
-	// 同步每个服务
-	for name := range watchNamesSet {
-		go e.syncServiceByName(name)
-	}
+	e.lock.Lock()
+	changes := e.cache.Compare(cs)
+	e.cache = cs
+	e.lock.Unlock()
+	e.ntfChange(changes)
 }
 
 // Register 注册服务信息到发现服务中
@@ -317,53 +356,71 @@ func (e *EtcdDiscovery) Register(provider ServerInfoProvider) (err error) {
 	if e.localServices[name] == nil {
 		e.localServices[name] = make(map[string]ServerInfoProvider)
 	}
-	if e.leases[name] == nil {
-		e.leases[name] = make(map[string]clientv3.LeaseID)
-	}
 	e.localServices[name][id] = provider
+	e.localIDs[id] = struct{}{}
+	// 如果全局lease还未创建，则创建它
+	if !e.leaseCreated {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	// 创建lease
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		leaseResp, err := e.client.Grant(ctx, e.leaseTTL)
+		if err != nil {
+			return fmt.Errorf("create global lease error: %v", err)
+		}
 
-	leaseResp, err := e.client.Grant(ctx, e.leaseTTL)
-	if err != nil {
-		return fmt.Errorf("create lease error: %v", err)
+		e.globalLease = leaseResp.ID
+		e.leaseCreated = true
+
+		// 启动全局lease的续约
+		go e.maintainGlobalLease()
 	}
-
-	e.leases[name][id] = leaseResp.ID
 
 	// 立即将服务信息写入etcd
-	if err := e.updateServiceToEtcd(info, leaseResp.ID); err != nil {
+	if err := e.updateServiceToEtcd(info, e.globalLease); err != nil {
 		e.lg.Warnf("initial service update to etcd failed: %v", err)
 	}
 
-	// 启动续约和更新goroutine
-	go e.maintainService(name, id, provider, leaseResp.ID)
+	// 启动服务更新goroutine
+	go e.maintainService(name, id, provider, e.globalLease)
 
 	return nil
 }
 
 // maintainService 维护服务注册（续约和更新）
-func (e *EtcdDiscovery) maintainService(name, id string, provider ServerInfoProvider, leaseID clientv3.LeaseID) {
+// maintainGlobalLease 维护全局lease的续约
+func (e *EtcdDiscovery) maintainGlobalLease() {
 	defer func() {
 		if r := recover(); r != nil {
-			e.lg.Errorf("maintain service %s/%s panic: %v", name, id, r)
+			e.lg.Errorf("maintain global lease panic: %v", r)
 		}
 	}()
 
 	// 启动lease续约
-	keepAliveCh, kaerr := e.client.KeepAlive(context.Background(), leaseID)
+	keepAliveCh, kaerr := e.client.KeepAlive(context.Background(), e.globalLease)
 	if kaerr != nil {
-		e.lg.Errorf("keep alive lease error: %v", kaerr)
+		e.lg.Errorf("keep alive global lease error: %v", kaerr)
 		return
 	}
 
 	// 消费keepalive响应
-	go func() {
-		for ka := range keepAliveCh {
+	for {
+		select {
+		case <-e.done:
+			return
+		case ka := <-keepAliveCh:
+			if ka == nil {
+				e.lg.Warn("global lease keepalive channel closed")
+				return
+			}
 			// 处理keepalive响应（可以记录日志等）
-			_ = ka
+		}
+	}
+}
+
+func (e *EtcdDiscovery) maintainService(name, id string, provider ServerInfoProvider, leaseID clientv3.LeaseID) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.lg.Errorf("maintain service %s/%s panic: %v", name, id, r)
 		}
 	}()
 
@@ -388,9 +445,11 @@ func (e *EtcdDiscovery) maintainService(name, id string, provider ServerInfoProv
 			// 定时更新服务信息
 			info := provider.ServerInfo()
 			versionChanged := info.GetVersion() != lastVersion
-			e.updateServiceToEtcd(info, leaseID)
-			lastVersion = info.GetVersion()
-			_ = versionChanged // 可以用于优化，版本未变化时减少更新频率
+			if versionChanged {
+				e.updateServiceToEtcd(info, leaseID)
+				lastVersion = info.GetVersion()
+			}
+			//_ = versionChanged // 可以用于优化，版本未变化时减少更新频率
 		}
 	}
 }
@@ -434,25 +493,12 @@ func (e *EtcdDiscovery) unregisterServiceUnsafe(name, id string) {
 		e.lg.Errorf("delete service from etcd error: %v", err)
 	}
 
-	// 撤销lease
-	if e.leases[name] != nil {
-		if leaseID, exists := e.leases[name][id]; exists {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			_, err := e.client.Revoke(ctx, leaseID)
-			if err != nil {
-				e.lg.Errorf("revoke lease error: %v", err)
-			}
-			delete(e.leases[name], id)
-			if len(e.leases[name]) == 0 {
-				delete(e.leases, name)
-			}
-		}
-	}
+	// 注意：不再撤销lease，因为使用全局lease，其他服务可能还在使用
 
 	// 删除本地服务记录
 	if e.localServices[name] != nil {
 		delete(e.localServices[name], id)
+		delete(e.localIDs, id)
 		if len(e.localServices[name]) == 0 {
 			delete(e.localServices, name)
 		}
@@ -475,11 +521,22 @@ func (e *EtcdDiscovery) Close() error {
 			}
 		}
 
+		// 撤销全局lease
+		if e.leaseCreated && e.globalLease != 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, err := e.client.Revoke(ctx, e.globalLease)
+			if err != nil {
+				e.lg.Errorf("revoke global lease error: %v", err)
+			}
+		}
+
 		// 清理资源
 		e.listeners = nil
 		e.cache = nil
 		e.localServices = nil
-		e.leases = nil
+		e.leaseCreated = false
+		e.globalLease = 0
 	})
 
 	return nil

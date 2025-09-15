@@ -1,6 +1,7 @@
 package rdsd
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -120,18 +121,21 @@ func (t *testListener) WatchNames() []string {
 }
 
 func (t *testListener) OnAdd(info ServerInfo) {
+	fmt.Println("OnAdd", info)
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	t.addEvents = append(t.addEvents, info)
 }
 
 func (t *testListener) OnRemove(info ServerInfo) {
+	fmt.Println("OnRemove", info)
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	t.removeEvents = append(t.removeEvents, info)
 }
 
 func (t *testListener) OnUpdate(info ServerInfo) {
+	fmt.Println("OnUpdate", info)
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	t.updateEvents = append(t.updateEvents, info)

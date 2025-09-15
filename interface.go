@@ -70,7 +70,7 @@ type Discovery interface {
 	LocalServers() (list []ServerInfo)
 	// AddListener 添加服务监听器
 	AddListener(l Listener)
-	// SyncServers 手动触发服务同步
+	// SyncServers 手动触发服务同步。不会触发监听器
 	SyncServers()
 	// Close 关闭服务发现，清理资源
 	Close() error
