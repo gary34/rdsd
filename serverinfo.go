@@ -1,4 +1,4 @@
-package ebsd
+package rdsd
 
 type BaseServerInfo struct {
 	ID         string
