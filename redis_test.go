@@ -236,7 +236,7 @@ func TestRedisDiscovery_Register(t *testing.T) {
 
 	// 验证Redis中的数据
 	ctx := context.Background()
-	key := "ebsd:service:test-service"
+	key := "rdsd:service:test-service"
 	result, err := client.HGet(ctx, key, "service1").Result()
 	require.NoError(t, err)
 	assert.NotEmpty(t, result)
@@ -265,7 +265,7 @@ func TestRedisDiscovery_GetServer(t *testing.T) {
 	data, err := marshaler.Marshal(testInfo)
 	require.NoError(t, err)
 
-	key := "ebsd:service:test-service"
+	key := "rdsd:service:test-service"
 	err = client.HSet(ctx, key, "service1", data).Err()
 	require.NoError(t, err)
 
@@ -300,7 +300,7 @@ func TestRedisDiscovery_GetServers(t *testing.T) {
 
 	// 直接向Redis写入多个测试数据
 	ctx := context.Background()
-	key := "ebsd:service:test-service"
+	key := "rdsd:service:test-service"
 
 	marshaler := NewJSONMarshaller(func() ServerInfo {
 		return &testServerInfo{}
@@ -394,7 +394,7 @@ func TestRedisDiscovery_AddListener(t *testing.T) {
 
 	// 直接向Redis添加服务
 	ctx := context.Background()
-	key := "ebsd:service:test-service"
+	key := "rdsd:service:test-service"
 
 	testInfo := &testServerInfo{
 		ID:         "service1",
@@ -549,12 +549,16 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	// 验证discovery2通过pub/sub通知感知到了服务变化
 	info := discovery2.GetServer("test-service", "service1")
 	assert.NotNil(t, info, "discovery2应该通过pub/sub通知感知到服务注册")
-	assert.Equal(t, "v1.0.0", info.GetVersion())
+	if info != nil {
+		assert.Equal(t, "v1.0.0", info.GetVersion())
+	}
 
 	// 验证监听器收到添加事件
 	addEvents := listener.GetAddEvents()
 	assert.Len(t, addEvents, 1, "监听器应该收到服务添加事件")
-	assert.Equal(t, "service1", addEvents[0].GetID())
+	if len(addEvents) > 0 {
+		assert.Equal(t, "service1", addEvents[0].GetID())
+	}
 
 	// 测试服务注销的pub/sub通知
 	listener.ClearEvents()
@@ -570,7 +574,9 @@ func TestRedisDiscovery_PubSubNotification(t *testing.T) {
 	// 验证监听器收到删除事件
 	removeEvents := listener.GetRemoveEvents()
 	assert.Len(t, removeEvents, 1, "监听器应该收到服务删除事件")
-	assert.Equal(t, "service1", removeEvents[0].GetID())
+	if len(removeEvents) > 0 {
+		assert.Equal(t, "service1", removeEvents[0].GetID())
+	}
 }
 
 // TestRedisDiscovery_Close 测试Close方法

@@ -602,7 +602,7 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 	}
 	// 更新本地缓存
 	r.lock.Lock()
-	versionChange := r.localServices[name][id].GetVersion() == info.GetVersion()
+	versionChange := r.localServices[name][id].GetVersion() != info.GetVersion()
 	r.localServices[name][id] = info.Clone()
 	r.lock.Unlock()
 	r.lg.WithFields(logrus.Fields{
@@ -622,7 +622,7 @@ func (r *RedisDiscovery) updateService(name, id string, info ServerInfo) error {
 }
 
 func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo, versionChange bool) error {
-	key := fmt.Sprintf("rdsd:service:%s", info.GetName())
+	key := r.key(info.GetName())
 	ctx := context.Background()
 
 	r.lg.WithFields(logrus.Fields{
@@ -675,7 +675,7 @@ func (r *RedisDiscovery) updateServiceToRedis(info ServerInfo, versionChange boo
 }
 
 func (r *RedisDiscovery) unregisterService(name, id string) {
-	key := fmt.Sprintf("rdsd:service:%s", name)
+	key := r.key(name)
 	ctx := context.Background()
 
 	r.lg.WithFields(logrus.Fields{
