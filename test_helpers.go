@@ -121,21 +121,21 @@ func (t *testListener) WatchNames() []string {
 }
 
 func (t *testListener) OnAdd(info ServerInfo) {
-	fmt.Println("OnAdd", info)
+	fmt.Println("OnAdd", info, time.Now())
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	t.addEvents = append(t.addEvents, info)
 }
 
 func (t *testListener) OnRemove(info ServerInfo) {
-	fmt.Println("OnRemove", info)
+	fmt.Println("OnRemove", info, time.Now())
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	t.removeEvents = append(t.removeEvents, info)
 }
 
 func (t *testListener) OnUpdate(info ServerInfo) {
-	fmt.Println("OnUpdate", info)
+	fmt.Println("OnUpdate", info, time.Now())
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
 	t.updateEvents = append(t.updateEvents, info)

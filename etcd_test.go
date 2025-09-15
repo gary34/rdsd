@@ -61,13 +61,21 @@ func TestEtcdDiscovery_Lease(t *testing.T) {
 	discovery, client := setupTestEtcdDiscovery(t)
 	defer client.Close()
 	defer discovery.Close()
+	discovery1, _ := setupTestEtcdDiscovery(t)
+	defer discovery1.Close()
 	// 创建测试服务提供者
 	provider := newTestServerInfoProvider("server1", "test-service", "v1.0")
 	defer provider.Close()
+	// 创建监听器
+	listener := newTestListener("test-service")
+	discovery1.AddListener(listener)
 	// 注册服务
 	err := discovery.Register(provider)
 	require.NoError(t, err)
-	time.Sleep(time.Hour)
+	time.Sleep(time.Second * 10)
+	list := discovery1.GetServers("test-service")
+	assert.Len(t, list, 1)
+	assert.Equal(t, "server1", list[0].GetID())
 }
 
 func TestEtcdDiscovery_Register(t *testing.T) {

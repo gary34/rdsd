@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -62,9 +63,9 @@ type EtcdDiscovery struct {
 	localServices map[string]map[string]ServerInfoProvider
 	localIDs      map[string]struct{}
 	// 统一的lease ID，所有服务共享
-	globalLease clientv3.LeaseID
+	globalLease atomic.Int64
 	// lease是否已创建
-	leaseCreated bool
+	//leaseCreated bool
 	// watch相关
 	watchCtx    context.Context
 	watchCancel context.CancelFunc
@@ -92,15 +93,14 @@ func NewEtcdDiscovery(client *clientv3.Client, marshaler Marshaller, prefix stri
 		cache:         make(serverCaches),
 		localServices: make(map[string]map[string]ServerInfoProvider),
 		localIDs:      make(map[string]struct{}),
-		globalLease:   0, // 初始化为0，表示未创建
-		leaseCreated:  false,
+		globalLease:   atomic.Int64{}, // 初始化为0，表示未创建
 		watchCtx:      watchCtx,
 		watchCancel:   watchCancel,
 	}
 
 	// 启动watch监听
 	go d.startWatcher()
-
+	d.maintainGlobalLease()
 	return d
 }
 
@@ -358,35 +358,15 @@ func (e *EtcdDiscovery) Register(provider ServerInfoProvider) (err error) {
 	}
 	e.localServices[name][id] = provider
 	e.localIDs[id] = struct{}{}
-	// 如果全局lease还未创建，则创建它
-	if !e.leaseCreated {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		leaseResp, err := e.client.Grant(ctx, e.leaseTTL)
-		if err != nil {
-			return fmt.Errorf("create global lease error: %v", err)
-		}
-
-		e.globalLease = leaseResp.ID
-		e.leaseCreated = true
-
-		// 启动全局lease的续约
-		go e.maintainGlobalLease()
-	}
-
+	// 启动服务更新goroutine
 	// 立即将服务信息写入etcd
-	if err := e.updateServiceToEtcd(info, e.globalLease); err != nil {
+	if err := e.updateServiceToEtcd(info); err != nil {
 		e.lg.Warnf("initial service update to etcd failed: %v", err)
 	}
-
-	// 启动服务更新goroutine
-	go e.maintainService(name, id, provider, e.globalLease)
-
+	go e.maintainService(name, id, provider)
 	return nil
 }
 
-// maintainService 维护服务注册（续约和更新）
 // maintainGlobalLease 维护全局lease的续约
 func (e *EtcdDiscovery) maintainGlobalLease() {
 	defer func() {
@@ -395,29 +375,50 @@ func (e *EtcdDiscovery) maintainGlobalLease() {
 		}
 	}()
 
-	// 启动lease续约
-	keepAliveCh, kaerr := e.client.KeepAlive(context.Background(), e.globalLease)
-	if kaerr != nil {
-		e.lg.Errorf("keep alive global lease error: %v", kaerr)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	leaseResp, err := e.client.Grant(ctx, e.leaseTTL)
+	if err != nil {
+		e.lg.WithError(err).Error("maintain global lease failed")
+		time.AfterFunc(time.Second, e.maintainGlobalLease)
 		return
 	}
-
-	// 消费keepalive响应
-	for {
-		select {
-		case <-e.done:
-			return
-		case ka := <-keepAliveCh:
-			if ka == nil {
-				e.lg.Warn("global lease keepalive channel closed")
-				return
-			}
-			// 处理keepalive响应（可以记录日志等）
-		}
+	e.lg.WithField("leaseID", leaseResp.ID).Info("maintain global lease success")
+	e.globalLease.Store(int64(leaseResp.ID))
+	// 启动lease续约
+	keepAliveCh, kaerr := e.client.KeepAlive(context.Background(), leaseResp.ID)
+	if kaerr != nil {
+		e.lg.Errorf("keep alive global lease error: %v", kaerr)
+		time.AfterFunc(time.Second, e.maintainGlobalLease)
+		return
 	}
-}
+	for _, info := range e.LocalServers() {
+		e.updateServiceToEtcd(info)
+	}
+	go func() {
+		// 消费keepalive响应
+		for {
+			select {
+			case <-e.done:
+				return
+			case ka := <-keepAliveCh:
+				if ka == nil {
+					e.lg.Warn("global lease keepalive channel closed")
+					time.AfterFunc(time.Second, e.maintainGlobalLease)
+					return
+				}
+				// 处理keepalive响应（可以记录日志等）
+			}
+		}
+	}()
 
-func (e *EtcdDiscovery) maintainService(name, id string, provider ServerInfoProvider, leaseID clientv3.LeaseID) {
+}
+func (e *EtcdDiscovery) leaseID() clientv3.LeaseID {
+	load := e.globalLease.Load()
+	return clientv3.LeaseID(load)
+}
+func (e *EtcdDiscovery) maintainService(name, id string, provider ServerInfoProvider) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.lg.Errorf("maintain service %s/%s panic: %v", name, id, r)
@@ -439,15 +440,21 @@ func (e *EtcdDiscovery) maintainService(name, id string, provider ServerInfoProv
 			return
 		case info := <-provider.Update():
 			// 服务信息更新
-			e.updateServiceToEtcd(info, leaseID)
-			lastVersion = info.GetVersion()
+			if err := e.updateServiceToEtcd(info); err != nil {
+				e.lg.Errorf("update service to etcd error: %v", err)
+			} else {
+				lastVersion = info.GetVersion()
+			}
 		case <-ticker.C:
 			// 定时更新服务信息
 			info := provider.ServerInfo()
 			versionChanged := info.GetVersion() != lastVersion
 			if versionChanged {
-				e.updateServiceToEtcd(info, leaseID)
-				lastVersion = info.GetVersion()
+				if err := e.updateServiceToEtcd(info); err != nil {
+					e.lg.Errorf("update service to etcd error: %v", err)
+				} else {
+					lastVersion = info.GetVersion()
+				}
 			}
 			//_ = versionChanged // 可以用于优化，版本未变化时减少更新频率
 		}
@@ -455,17 +462,20 @@ func (e *EtcdDiscovery) maintainService(name, id string, provider ServerInfoProv
 }
 
 // updateServiceToEtcd 更新服务信息到etcd
-func (e *EtcdDiscovery) updateServiceToEtcd(info ServerInfo, leaseID clientv3.LeaseID) error {
+func (e *EtcdDiscovery) updateServiceToEtcd(info ServerInfo) error {
 	data, err := e.marshaler.Marshal(info)
 	if err != nil {
 		return fmt.Errorf("marshal server info error: %v", err)
 	}
-
+	lease := e.leaseID()
+	if lease == 0 {
+		return fmt.Errorf("lease not yet created")
+	}
 	key := e.serviceKey(info.GetName(), info.GetID())
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	_, err = e.client.Put(ctx, key, string(data), clientv3.WithLease(leaseID))
+	_, err = e.client.Put(ctx, key, string(data), clientv3.WithLease(lease))
 	if err != nil {
 		e.lg.Errorf("update service to etcd error: %v", err)
 		return err
@@ -522,10 +532,10 @@ func (e *EtcdDiscovery) Close() error {
 		}
 
 		// 撤销全局lease
-		if e.leaseCreated && e.globalLease != 0 {
+		if lease := e.leaseID(); lease != 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_, err := e.client.Revoke(ctx, e.globalLease)
+			_, err := e.client.Revoke(ctx, lease)
 			if err != nil {
 				e.lg.Errorf("revoke global lease error: %v", err)
 			}
@@ -535,8 +545,7 @@ func (e *EtcdDiscovery) Close() error {
 		e.listeners = nil
 		e.cache = nil
 		e.localServices = nil
-		e.leaseCreated = false
-		e.globalLease = 0
+		e.globalLease.Store(0)
 	})
 
 	return nil
