@@ -82,7 +82,7 @@ func NewEtcdDiscovery(client *clientv3.Client, marshaler Marshaller, prefix stri
 
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 
-	d := &EtcdDiscovery{
+	e := &EtcdDiscovery{
 		client:        client,
 		marshaler:     marshaler,
 		prefix:        prefix,
@@ -99,9 +99,10 @@ func NewEtcdDiscovery(client *clientv3.Client, marshaler Marshaller, prefix stri
 	}
 
 	// 启动watch监听
-	go d.startWatcher()
-	d.maintainGlobalLease()
-	return d
+	e.startWatcher()
+	// 启动keepalive
+	e.startKeepAlive()
+	return e
 }
 
 // serviceKey 生成服务在etcd中的key
@@ -135,29 +136,30 @@ func (e *EtcdDiscovery) parseServiceKey(key string) (name, id string, ok bool) {
 
 // startWatcher 启动etcd watch监听
 func (e *EtcdDiscovery) startWatcher() {
-	defer func() {
-		if r := recover(); r != nil {
-			e.lg.Errorf("watcher panic: %v", r)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				e.lg.Errorf("watcher panic: %v", r)
+			}
+		}()
+		watchChan := e.client.Watch(e.watchCtx, e.prefix+"/service/", clientv3.WithPrefix())
+		for {
+			select {
+			case <-e.done:
+				return
+			case watchResp := <-watchChan:
+				if watchResp.Err() != nil {
+					e.lg.Errorf("watch error: %v", watchResp.Err())
+					continue
+				}
+
+				for _, event := range watchResp.Events {
+					e.handleWatchEvent(event)
+				}
+			}
 		}
 	}()
 
-	watchChan := e.client.Watch(e.watchCtx, e.prefix+"/service/", clientv3.WithPrefix())
-
-	for {
-		select {
-		case <-e.done:
-			return
-		case watchResp := <-watchChan:
-			if watchResp.Err() != nil {
-				e.lg.Errorf("watch error: %v", watchResp.Err())
-				continue
-			}
-
-			for _, event := range watchResp.Events {
-				e.handleWatchEvent(event)
-			}
-		}
-	}
 }
 
 type serverChanges struct {
@@ -350,14 +352,13 @@ func (e *EtcdDiscovery) Register(provider ServerInfoProvider) (err error) {
 	id := info.GetID()
 
 	e.lock.Lock()
-	defer e.lock.Unlock()
-
 	// 添加到本地服务列表
 	if e.localServices[name] == nil {
 		e.localServices[name] = make(map[string]ServerInfoProvider)
 	}
 	e.localServices[name][id] = provider
 	e.localIDs[id] = struct{}{}
+	e.lock.Unlock()
 	// 启动服务更新goroutine
 	// 立即将服务信息写入etcd
 	if err := e.updateServiceToEtcd(info); err != nil {
@@ -367,8 +368,20 @@ func (e *EtcdDiscovery) Register(provider ServerInfoProvider) (err error) {
 	return nil
 }
 
-// maintainGlobalLease 维护全局lease的续约
-func (e *EtcdDiscovery) maintainGlobalLease() {
+func (e *EtcdDiscovery) startKeepAlive() () {
+	go func() {
+		for {
+			isDone := e.keepAlive()
+			if isDone {
+				return
+			}
+			time.Sleep(time.Second * 3)
+		}
+	}()
+}
+
+// keepAlive 维护全局lease的续约
+func (e *EtcdDiscovery) keepAlive() (done bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			e.lg.Errorf("maintain global lease panic: %v", r)
@@ -381,7 +394,7 @@ func (e *EtcdDiscovery) maintainGlobalLease() {
 	leaseResp, err := e.client.Grant(ctx, e.leaseTTL)
 	if err != nil {
 		e.lg.WithError(err).Error("maintain global lease failed")
-		time.AfterFunc(time.Second, e.maintainGlobalLease)
+		//time.AfterFunc(time.Second, e.maintainGlobalLease)
 		return
 	}
 	e.lg.WithField("leaseID", leaseResp.ID).Info("maintain global lease success")
@@ -390,28 +403,27 @@ func (e *EtcdDiscovery) maintainGlobalLease() {
 	keepAliveCh, kaerr := e.client.KeepAlive(context.Background(), leaseResp.ID)
 	if kaerr != nil {
 		e.lg.Errorf("keep alive global lease error: %v", kaerr)
-		time.AfterFunc(time.Second, e.maintainGlobalLease)
+		//time.AfterFunc(time.Second, e.maintainGlobalLease)
 		return
 	}
 	for _, info := range e.LocalServers() {
 		e.updateServiceToEtcd(info)
 	}
-	go func() {
-		// 消费keepalive响应
-		for {
-			select {
-			case <-e.done:
+	// 消费keepalive响应
+	for {
+		select {
+		case <-e.done:
+			done = true
+			return
+		case ka := <-keepAliveCh:
+			if ka == nil {
+				e.lg.Warn("global lease keepalive channel closed")
+				//time.AfterFunc(time.Second, e.maintainGlobalLease)
 				return
-			case ka := <-keepAliveCh:
-				if ka == nil {
-					e.lg.Warn("global lease keepalive channel closed")
-					time.AfterFunc(time.Second, e.maintainGlobalLease)
-					return
-				}
-				// 处理keepalive响应（可以记录日志等）
 			}
+			// 处理keepalive响应（可以记录日志等）
 		}
-	}()
+	}
 
 }
 func (e *EtcdDiscovery) leaseID() clientv3.LeaseID {
